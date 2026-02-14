@@ -83,7 +83,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.actor }}/deepseek2api:${{ steps.get_version.outputs.version }}
-            ghcr.io/${{ github.actor }}/deepseek2api:latest
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.get_version.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
           platforms: linux/amd64,linux/arm64
           build-args: TARGETPLATFORM=${{ matrix.platform }}
