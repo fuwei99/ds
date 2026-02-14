@@ -1,28 +1,15 @@
 {
   "keys": [
-    "key1",
-    "key2"
+    "sk-deepseek2api"
   ],
+  "auto_upload_token_threshold": 400000,
+  "auto_upload_char_threshold_max": 700000,
+  "auto_upload_char_threshold_min": 400000,
   "accounts": [
     {
-      "email": "example1@example.com",
-      "password": "password1",
-      "token": ""
-    },
-    {
-      "email": "example2@example.com",
-      "password": "password2",
-      "token": ""
-    },
-    {
-      "mobile": "12345678901",
-      "password": "password3",
-      "token": ""
-    },
-    {
-      "mobile": "12345678901",
-      "password": "password4",
-      "token": ""
+      "email": "timigogohehe@gmail.com",
+      "password": "wEi123..",
+      "token": "nIp0Y8/tuklVgCPRU52gtT21aqtXvY1uM1RXkkkHOBZoBeOEk6NUTz+tvlhAxh/E"
     }
   ]
 }
