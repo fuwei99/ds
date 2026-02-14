@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 import transformers
+import os
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,13 +50,32 @@ CONFIG_PATH = "config.json"
 
 
 def load_config():
-    """从 config.json 加载配置，出错则返回空 dict"""
+    """从 config.json 加载配置，或者从环境变量 CONFIG_JSON 加载"""
+    # 优先检查环境变量 CONFIG_JSON
+    env_config = os.getenv("CONFIG_JSON")
+    if env_config:
+        try:
+            logger.info("[load_config] 检测到环境变量 CONFIG_JSON，正在加载...")
+            config_data = json.loads(env_config)
+            # 尝试写入 config.json 以便后续 save_config 能正常工作（非必须，视需求而定）
+            try:
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(config_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"[load_config] 无法写入配置文件 (可能是只读文件系统): {e}")
+            return config_data
+        except Exception as e:
+            logger.error(f"[load_config] 解析环境变量 CONFIG_JSON 失败: {e}")
+
+    # 其次检查本地文件
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
     except Exception as e:
         logger.warning(f"[load_config] 无法读取配置文件: {e}")
-        return {}
+    
+    return {}
 
 
 def save_config(cfg):
@@ -2545,4 +2565,4 @@ def index(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=5001)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 7860)))
