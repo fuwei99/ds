@@ -284,6 +284,372 @@ def get_auth_headers(request: Request):
 
 
 # ----------------------------------------------------------------------
+# (5.5) 自动文件上传相关辅助函数
+# ----------------------------------------------------------------------
+def estimate_tokens(text: str) -> int:
+    """
+    估算文本的 token 数
+    - 短文本（≤100k字符）：用真实 tokenizer 精确计算
+    - 长文本（>100k字符）：用官方比例快速估算，避免 tokenizer 卡顿
+      - 拉丁字符 ≈ 0.3 token
+      - 中文字符 ≈ 0.6 token
+    """
+    if len(text) <= 100000:
+        try:
+            return len(tokenizer.encode(text))
+        except Exception:
+            pass
+    
+    # 长文本快速估算
+    cjk_count = 0
+    latin_count = 0
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+            cjk_count += 1
+        else:
+            latin_count += 1
+    return int(cjk_count * 0.6 + latin_count * 0.3)
+
+
+def check_upload_necessity(text: str) -> bool:
+    """
+    判断是否需要自动上传文件
+    - > 700k 字符 (配置:auto_upload_char_threshold_max) -> 直接上传
+    - < 400k 字符 (配置:auto_upload_char_threshold_min) -> 直接跳过
+    - 中间 -> 计算 token 判断 > 阈值
+    """
+    total_chars = len(text)
+    char_max = CONFIG.get("auto_upload_char_threshold_max", 700000)
+    char_min = CONFIG.get("auto_upload_char_threshold_min", 400000)
+    token_limit = CONFIG.get("auto_upload_token_threshold", 400000)
+    
+    # 1. 字符数超大 -> 直接上传
+    if total_chars > char_max:
+        logger.info(f"[check_upload] 字符数({total_chars:,}) > {char_max:,}，直接上传")
+        return True
+    
+    # 2. 字符数较小 -> 直接跳过
+    if total_chars < char_min:
+        return False
+        
+    # 3. 中间区间 -> 计算 Token
+    estimated = estimate_tokens(text)
+    if estimated > token_limit:
+        logger.info(f"[check_upload] 字符数({total_chars:,}) token数({estimated:,}) > {token_limit:,}，需要上传")
+        return True
+    
+    return False
+
+
+def parse_upload_tags(messages: list) -> dict:
+    """
+    从消息列表中解析文件上传控制标签，并清除所有标签。
+    
+    标签定义：
+    - <||file-upload:True||>    强制上传
+    - <||fileid:True||>         回复中返回文件ID
+    - <||file-reupload:True||>  复用已有文件（截断旧消息）
+    - <||upload-all:True||>     复用模式下不截断
+    - <||file:name:id||>        已有文件引用
+    
+    返回 dict:
+    {
+        "force_upload": bool,
+        "return_fileid": bool,
+        "reupload": bool,
+        "upload_all": bool,
+        "existing_files": [{"name": str, "id": str}, ...],  (去重)
+        "first_file_ref_index": int or None,  (第一个包含文件引用的消息索引)
+    }
+    
+    副作用：会修改 messages 中的 content，清除所有标签。
+    """
+    result = {
+        "force_upload": False,
+        "return_fileid": False,
+        "reupload": False,
+        "upload_all": False,
+        "existing_files": [],
+        "first_file_ref_index": None,
+    }
+    
+    seen_file_ids = set()
+    
+    # 标签正则
+    tag_pattern = re.compile(r'<\|\|(.+?)\|\|>')
+    file_ref_pattern = re.compile(r'<\|\|file:(.+?):(.+?)\|\|>')
+    
+    for idx, msg in enumerate(messages):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # 处理数组格式的 content
+            for item in content:
+                if item.get("type") == "text":
+                    text = item.get("text", "")
+                    # 提取文件引用
+                    for m in file_ref_pattern.finditer(text):
+                        fname, fid = m.group(1), m.group(2)
+                        if fid not in seen_file_ids:
+                            seen_file_ids.add(fid)
+                            result["existing_files"].append({"name": fname, "id": fid})
+                        if result["first_file_ref_index"] is None:
+                            result["first_file_ref_index"] = idx
+                    # 提取控制标签
+                    if "<||file-upload:True||>" in text:
+                        result["force_upload"] = True
+                    if "<||fileid:True||>" in text:
+                        result["return_fileid"] = True
+                    if "<||file-reupload:True||>" in text:
+                        result["reupload"] = True
+                    if "<||upload-all:True||>" in text:
+                        result["upload_all"] = True
+                    # 清除所有标签
+                    item["text"] = tag_pattern.sub("", text).strip()
+        elif isinstance(content, str):
+            # 提取文件引用
+            for m in file_ref_pattern.finditer(content):
+                fname, fid = m.group(1), m.group(2)
+                if fid not in seen_file_ids:
+                    seen_file_ids.add(fid)
+                    result["existing_files"].append({"name": fname, "id": fid})
+                if result["first_file_ref_index"] is None:
+                    result["first_file_ref_index"] = idx
+            # 提取控制标签
+            if "<||file-upload:True||>" in content:
+                result["force_upload"] = True
+            if "<||fileid:True||>" in content:
+                result["return_fileid"] = True
+            if "<||file-reupload:True||>" in content:
+                result["reupload"] = True
+            if "<||upload-all:True||>" in content:
+                result["upload_all"] = True
+            # 清除所有标签
+            msg["content"] = tag_pattern.sub("", content).strip()
+    
+    return result
+
+
+def upload_to_deepseek(token: str, content: str, filename: str = "user_input.txt"):
+    """
+    上传文本内容到 DeepSeek，返回 file_id
+    
+    流程：
+    1. 创建临时文件
+    2. 获取上传专用 PoW
+    3. 手动构造 multipart/form-data
+    4. 上传文件
+    5. 轮询 fetch_files 等待文件处理完成
+    6. 删除临时文件
+    7. 返回 file_id
+    """
+    import tempfile
+    import uuid
+    import os
+    
+    # 1. 创建临时文件
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+        f.write(content)
+        temp_path = f.name
+    
+    try:
+        # 2. 获取文件大小
+        file_size = os.path.getsize(temp_path)
+        
+        # 3. 获取上传 PoW
+        pow_resp = create_pow_challenge_direct(token, "/api/v0/file/upload_file")
+        if not pow_resp:
+            logger.warning("[upload_to_deepseek] 获取 PoW 失败")
+            return None
+        
+        # 4. 手动构造 multipart/form-data
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex[:16]}"
+        
+        with open(temp_path, 'rb') as f:
+            file_data = f.read()
+        
+        body_parts = [
+            f'--{boundary}'.encode(),
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode(),
+            b'Content-Type: text/plain',
+            b'',
+            file_data,
+            f'--{boundary}--'.encode()
+        ]
+        body = b'\r\n'.join(body_parts)
+        
+        # 5. 上传
+        headers = {**BASE_HEADERS, "authorization": f"Bearer {token}"}
+        headers["x-ds-pow-response"] = pow_resp
+        headers["x-file-size"] = str(file_size)
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        
+        logger.info(f"[upload_to_deepseek] 开始上传，大小: {file_size:,} 字节")
+        
+        resp = requests.post(
+            f"https://{DEEPSEEK_HOST}/api/v0/file/upload_file",
+            headers=headers,
+            data=body,
+            impersonate="safari15_3",
+            timeout=120
+        )
+        
+        if resp.status_code != 200:
+            logger.warning(f"[upload_to_deepseek] 上传失败，状态码: {resp.status_code}")
+            return None
+        
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.warning(f"[upload_to_deepseek] 上传业务错误: {data}")
+            return None
+        
+        file_id = data["data"]["biz_data"]["id"]
+        initial_status = data["data"]["biz_data"].get("status", "")
+        token_usage = data["data"]["biz_data"].get("token_usage", 0)
+        logger.info(f"[upload_to_deepseek] 上传响应: file_id={file_id}, status={initial_status}, tokens={token_usage:,}")
+        
+        # 6. 轮询 fetch_files 等待文件处理完成
+        if initial_status == "SUCCESS" and token_usage > 0:
+            logger.info(f"[upload_to_deepseek] ✅ 文件已就绪")
+            return file_id
+        
+        file_id = wait_for_file_ready(token, file_id)
+        return file_id
+    
+    except Exception as e:
+        logger.error(f"[upload_to_deepseek] 上传异常: {e}")
+        return None
+    
+    finally:
+        # 7. 删除临时文件
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except:
+            pass
+
+
+def wait_for_file_ready(token: str, file_id: str, max_wait=120, interval=3):
+    """
+    轮询 fetch_files API 等待文件处理完成
+    
+    参数：
+    - max_wait: 最大等待时间（秒），默认120秒
+    - interval: 轮询间隔（秒），默认3秒
+    
+    返回：file_id（成功）或 None（超时/失败）
+    """
+    headers = {**BASE_HEADERS, "authorization": f"Bearer {token}"}
+    fetch_url = f"https://{DEEPSEEK_HOST}/api/v0/file/fetch_files?file_ids={file_id}"
+    
+    start_time = time.time()
+    attempt = 0
+    
+    while time.time() - start_time < max_wait:
+        attempt += 1
+        time.sleep(interval)
+        
+        try:
+            resp = requests.get(
+                fetch_url,
+                headers=headers,
+                impersonate="safari15_3",
+                timeout=15
+            )
+            
+            if resp.status_code != 200:
+                logger.warning(f"[wait_for_file] 第{attempt}次轮询失败，状态码: {resp.status_code}")
+                continue
+            
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.warning(f"[wait_for_file] 第{attempt}次轮询业务错误: {data}")
+                continue
+            
+            files = data.get("data", {}).get("biz_data", {}).get("files", [])
+            if not files:
+                logger.warning(f"[wait_for_file] 第{attempt}次轮询：文件列表为空")
+                continue
+            
+            file_info = files[0]
+            status = file_info.get("status", "")
+            token_usage = file_info.get("token_usage", 0)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"[wait_for_file] 第{attempt}次轮询: status={status}, tokens={token_usage:,}, 耗时={elapsed:.1f}s")
+            
+            if status == "SUCCESS" and token_usage > 0:
+                logger.info(f"[wait_for_file] ✅ 文件已就绪！token_usage={token_usage:,}")
+                return file_id
+            elif status in ("FAILED", "ERROR"):
+                logger.error(f"[wait_for_file] ❌ 文件处理失败: {file_info}")
+                return None
+            # 其他状态（PROCESSING 等）继续等待
+            
+        except Exception as e:
+            logger.warning(f"[wait_for_file] 第{attempt}次轮询异常: {e}")
+    
+    logger.error(f"[wait_for_file] ❌ 超时！等待 {max_wait}s 后文件仍未就绪")
+    return None
+
+
+def create_pow_challenge_direct(token: str, target_path: str):
+    """
+    直接创建 PoW 挑战（不依赖 Request 对象）
+    用于文件上传等场景
+    """
+    headers = {**BASE_HEADERS, "authorization": f"Bearer {token}"}
+    try:
+        resp = requests.post(
+            DEEPSEEK_CREATE_POW_URL,
+            headers=headers,
+            json={"target_path": target_path},
+            timeout=30,
+            impersonate="safari15_3",
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if data.get("code") != 0:
+            logger.warning(f"[create_pow_challenge_direct] 获取失败: {data}")
+            return None
+        
+        challenge = data["data"]["biz_data"]["challenge"]
+        
+        # 计算 PoW 答案
+        answer = compute_pow_answer(
+            challenge["algorithm"],
+            challenge["challenge"],
+            challenge["salt"],
+            challenge.get("difficulty", 144000),
+            challenge.get("expire_at", int(time.time()) + 3600),
+            challenge["signature"],
+            challenge["target_path"],
+            WASM_PATH,
+        )
+        
+        if answer is None:
+            logger.warning("[create_pow_challenge_direct] PoW 计算失败")
+            return None
+        
+        # 编码为 base64
+        pow_dict = {
+            "algorithm": challenge["algorithm"],
+            "challenge": challenge["challenge"],
+            "salt": challenge["salt"],
+            "answer": answer,
+            "signature": challenge["signature"],
+            "target_path": challenge["target_path"],
+        }
+        pow_str = json.dumps(pow_dict, separators=(",", ":"), ensure_ascii=False)
+        encoded = base64.b64encode(pow_str.encode("utf-8")).decode("utf-8").rstrip()
+        return encoded
+    
+    except Exception as e:
+        logger.error(f"[create_pow_challenge_direct] 异常: {e}")
+        return None
+
+
+# ----------------------------------------------------------------------
 # Claude 认证相关函数
 # ----------------------------------------------------------------------
 def determine_claude_mode_and_token(request: Request):
@@ -423,11 +789,16 @@ async def call_claude_via_openai(request: Request, claude_payload):
 # (6) 封装对话接口调用的重试机制
 # ----------------------------------------------------------------------
 def call_completion_endpoint(payload, headers, max_attempts=3):
+    # 如果有文件引用，使用更长的超时（大文件处理耗时久，SSE流可能长时间无数据）
+    has_files = bool(payload.get("ref_file_ids", []))
+    timeout = 600 if has_files else 120
+    
     attempts = 0
     while attempts < max_attempts:
         try:
             deepseek_resp = requests.post(
-                DEEPSEEK_COMPLETION_URL, headers=headers, json=payload, stream=True, impersonate="safari15_3"
+                DEEPSEEK_COMPLETION_URL, headers=headers, json=payload, stream=True,
+                impersonate="safari15_3", timeout=timeout
             )
         except Exception as e:
             logger.warning(f"[call_completion_endpoint] 请求异常: {e}")
@@ -856,8 +1227,104 @@ async def chat_completions(request: Request):
             raise HTTPException(
                 status_code=503, detail=f"Model '{model}' is not available."
             )
-        # 使用 messages_prepare 函数构造最终 prompt
+        # ====== 解析标签 & 文件上传决策 ======
+        # 1. 先解析标签（会修改 messages，清除标签内容）
+        upload_tags = parse_upload_tags(messages)
+        logger.info(f"[upload_tags] 解析结果: force={upload_tags['force_upload']}, "
+                     f"fileid={upload_tags['return_fileid']}, reupload={upload_tags['reupload']}, "
+                     f"upload_all={upload_tags['upload_all']}, "
+                     f"existing_files={[f['id'] for f in upload_tags['existing_files']]}")
+        
+        # 2. 构造 prompt（标签已被清除）
         final_prompt = messages_prepare(messages)
+        
+        ref_file_ids = []
+        uploaded_file_info = None  # 记录本次上传的文件信息 {"name": str, "id": str}
+        upload_threshold = CONFIG.get("auto_upload_token_threshold", 450000)
+        
+        existing_file_ids = [f["id"] for f in upload_tags["existing_files"]]
+        
+        # 提取系统消息文本（上传文件后保留在 prompt 中）
+        system_text = ""
+        for m in messages:
+            if m.get("role") == "system":
+                c = m.get("content", "")
+                if isinstance(c, list):
+                    c = "\n".join(item.get("text", "") for item in c if item.get("type") == "text")
+                system_text += str(c) + "\n"
+        system_text = system_text.strip()
+        
+        def make_upload_prompt():
+            """构造上传后的 prompt：保留系统消息 + 用户提示"""
+            if system_text:
+                return f"{system_text}\n<｜User｜>(用户输入已作为文件上传，请直接分析文件内容)"
+            return "(用户输入已作为文件上传，请直接分析文件内容)"
+        
+        if upload_tags["force_upload"]:
+            # ===== 模式 A：强制上传 =====
+            logger.info("[mode_A] 强制上传模式")
+            filename = f"large_input_{int(time.time())}.txt"
+            file_id = upload_to_deepseek(request.state.deepseek_token, final_prompt, filename)
+            if file_id:
+                ref_file_ids = existing_file_ids + [file_id]
+                uploaded_file_info = {"name": filename, "id": file_id}
+                final_prompt = make_upload_prompt()
+                logger.info(f"[mode_A] ✅ 上传成功 file_id={file_id}")
+            else:
+                ref_file_ids = existing_file_ids
+                logger.warning("[mode_A] ⚠️ 上传失败，使用原文本")
+        
+        elif upload_tags["reupload"] and existing_file_ids:
+            if upload_tags["upload_all"]:
+                # ===== 模式 B2：不截断，不上传新文件，只挂已有 file_id =====
+                logger.info(f"[mode_B2] 复用模式(全量)，ref_file_ids={existing_file_ids}")
+                ref_file_ids = existing_file_ids
+                # final_prompt 保持原样
+            else:
+                # ===== 模式 B1：截断消息 + 复用已有 file_id =====
+                cut_index = upload_tags["first_file_ref_index"]
+                if cut_index is not None:
+                    # 只保留 system 消息 + cut_index 及之后的消息
+                    truncated_msgs = []
+                    for i, m in enumerate(messages):
+                        role = m.get("role", "")
+                        if role == "system":
+                            truncated_msgs.append(m)
+                        elif i >= cut_index:
+                            truncated_msgs.append(m)
+                    final_prompt = messages_prepare(truncated_msgs)
+                    logger.info(f"[mode_B1] 截断消息: 原{len(messages)}条 → {len(truncated_msgs)}条")
+                
+                ref_file_ids = list(existing_file_ids)
+                
+                # 截断后内容如果仍超过阈值，上传剩余部分
+                if check_upload_necessity(final_prompt):
+                    logger.info(f"[mode_B1] 截断后判定需要上传剩余部分")
+                    filename = f"remaining_{int(time.time())}.txt"
+                    file_id = upload_to_deepseek(request.state.deepseek_token, final_prompt, filename)
+                    if file_id:
+                        ref_file_ids.append(file_id)
+                        uploaded_file_info = {"name": filename, "id": file_id}
+                        final_prompt = make_upload_prompt()
+                        logger.info(f"[mode_B1] ✅ 剩余部分上传成功 file_id={file_id}")
+                
+                logger.info(f"[mode_B1] 最终 ref_file_ids={ref_file_ids}")
+        
+        else:
+            # ===== 模式 C：普通模式（阈值自动上传）=====
+            if check_upload_necessity(final_prompt):
+                logger.info(f"[mode_C] 判定需要自动上传")
+                filename = f"large_input_{int(time.time())}.txt"
+                file_id = upload_to_deepseek(request.state.deepseek_token, final_prompt, filename)
+                if file_id:
+                    ref_file_ids.append(file_id)
+                    uploaded_file_info = {"name": filename, "id": file_id}
+                    final_prompt = make_upload_prompt()
+                    logger.info(f"[mode_C] ✅ 上传成功 file_id={file_id}")
+                else:
+                    logger.warning(f"[mode_C] ⚠️ 上传失败，使用原文本")
+        # ==============================
+        
         session_id = create_session(request)
         if not session_id:
             raise HTTPException(status_code=401, detail="invalid token.")
@@ -872,7 +1339,7 @@ async def chat_completions(request: Request):
             "chat_session_id": session_id,
             "parent_message_id": None,
             "prompt": final_prompt,
-            "ref_file_ids": [],
+            "ref_file_ids": ref_file_ids,
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
         }
@@ -929,50 +1396,103 @@ async def chat_completions(request: Request):
                                     try:
                                         chunk = json.loads(data_str)
                                         
-                                        if "v" in chunk:
-                                            v_value = chunk["v"]
-                                            
-                                            # 构造新的 delta 格式的 chunk
-                                            content = ""
+                                        if "v" not in chunk:
+                                            continue
+                                        
+                                        v_value = chunk["v"]
+                                        p_value = chunk.get("p", "")
+                                        o_value = chunk.get("o", "")
 
-                                            if "p" in chunk and chunk.get("p") == "response/search_status":
-                                                continue
-                                                
-                                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                                ptype = "thinking"
-                                            elif "p" in chunk and chunk.get("p") == "response/content":
-                                                ptype = "text"
+                                        # --- 1. 跳过搜索状态 ---
+                                        if p_value == "response/search_status":
+                                            continue
 
-                                            # 处理文本内容
-                                            if isinstance(v_value, str):
-                                                content = v_value
-                                            # 处理数组更新如状态变更
-                                            elif isinstance(v_value, list):
-                                                for item in v_value:
-                                                    if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                        # 最终完成信号
-                                                        result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                                        result_queue.put(None)
-                                                        return
+                                        # --- 2. 检测 FINISHED 结束信号 ---
+                                        # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
+                                        if "status" in p_value and v_value == "FINISHED":
+                                            result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
+                                            result_queue.put(None)
+                                            return
+                                        # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
+                                        if isinstance(v_value, list) and p_value:
+                                            is_finished = False
+                                            for item in v_value:
+                                                if isinstance(item, dict) and item.get("v") == "FINISHED":
+                                                    is_finished = True
+                                                    break
+                                            if is_finished:
+                                                result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
+                                                result_queue.put(None)
+                                                return
+                                            # 非 FINISHED 的 list（如 fragment 切换），继续判断
+                                        
+                                        # --- 3. 检测 fragment 类型切换 ---
+                                        # 形式: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE",...}]}
+                                        if p_value == "response/fragments" and isinstance(v_value, list):
+                                            for frag in v_value:
+                                                if isinstance(frag, dict):
+                                                    frag_type = frag.get("type", "")
+                                                    if frag_type == "THINK":
+                                                        ptype = "thinking"
+                                                    elif frag_type == "RESPONSE":
+                                                        ptype = "text"
+                                            continue
+
+                                        # --- 4. 处理初始元数据 ---
+                                        # 形式: {"v":{"response":{...,"fragments":[{"type":"THINK",...}],...}}}
+                                        if isinstance(v_value, dict):
+                                            resp = v_value.get("response", {})
+                                            if resp:
+                                                fragments = resp.get("fragments", [])
+                                                for frag in fragments:
+                                                    if isinstance(frag, dict):
+                                                        frag_type = frag.get("type", "")
+                                                        if frag_type == "THINK":
+                                                            ptype = "thinking"
+                                                        elif frag_type == "RESPONSE":
+                                                            ptype = "text"
+                                            continue
+
+                                        # --- 5. 跳过非字符串内容（如 elapsed_secs 等数值） ---
+                                        if not isinstance(v_value, str):
+                                            continue
+
+                                        # --- 6. 跳过非内容路径的字符串 ---
+                                        # 只有以下情况才是真正的文本内容：
+                                        #   a) 无 p 字段的裸块: {"v":"..."}
+                                        #   b) fragment 内容追加: {"p":"response/fragments/-1/content",...}
+                                        #   c) 旧协议兼容: {"p":"response/thinking_content",...} 或 {"p":"response/content",...}
+                                        if p_value:
+                                            if "content" in p_value:
+                                                # 内容路径，兼容旧协议的类型切换
+                                                if p_value == "response/thinking_content":
+                                                    ptype = "thinking"
+                                                elif p_value == "response/content":
+                                                    ptype = "text"
+                                                # "response/fragments/-1/content" 保持当前 ptype
+                                            else:
+                                                # 非内容路径的字符串（如未知字段），跳过
                                                 continue
-                                            
-                                            # 构造兼容原逻辑的 chunk
-                                            unified_chunk = {
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "content": content,
-                                                        "type": ptype
-                                                    }
-                                                }],
-                                                "model": "",
-                                                "chunk_token_usage": len(content) // 4,  # 简单估算token数
-                                                "created": 0,
-                                                "message_id": -1,
-                                                "parent_id": -1
-                                            }
+
+                                        content = v_value
+
+                                        # 构造兼容原逻辑的 chunk
+                                        unified_chunk = {
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": content,
+                                                    "type": ptype
+                                                }
+                                            }],
+                                            "model": "",
+                                            "chunk_token_usage": len(content) // 4,
+                                            "created": 0,
+                                            "message_id": -1,
+                                            "parent_id": -1
+                                        }
                     
-                                            result_queue.put(unified_chunk)
+                                        result_queue.put(unified_chunk)
                                     except Exception as e:
                                         logger.warning(
                                             f"[sse_stream] 无法解析: {data_str}, 错误: {e}"
@@ -1003,6 +1523,8 @@ async def chat_completions(request: Request):
                             # )
                         finally:
                             deepseek_resp.close()
+                            # 确保在线程结束时发送结束信号，防止主线程死循环
+                            result_queue.put(None)
 
                     process_thread = threading.Thread(target=process_data)
                     process_thread.start()
@@ -1015,8 +1537,26 @@ async def chat_completions(request: Request):
                             last_send_time = current_time
                             continue
                         try:
-                            chunk = result_queue.get(timeout=0.05)
+                            # 增加 timeout 以便定期发送 keep-alive
+                            chunk = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT/2)
                             if chunk is None:
+                                # 如果需要返回文件ID，在结束前追加文件信息
+                                if upload_tags["return_fileid"] and uploaded_file_info:
+                                    file_tag = f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
+                                    file_info_chunk = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": model,
+                                        "choices": [{
+                                            "delta": {"content": file_tag},
+                                            "index": 0,
+                                            "finish_reason": None,
+                                        }],
+                                    }
+                                    yield f"data: {json.dumps(file_info_chunk, ensure_ascii=False)}\n\n"
+                                    final_text += file_tag
+                                
                                 # 发送最终统计信息
                                 prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                                 thinking_tokens = len(final_thinking) // 4  # 简单估算token数
@@ -1141,64 +1681,147 @@ async def chat_completions(request: Request):
                             try:
                                 chunk = json.loads(data_str)
             
-                                # 提取 v 字段
-                                if "v" in chunk:
-                                    v_value = chunk["v"]
-                                    
-                                    if "p" in chunk and chunk.get("p") == "response/search_status":
-                                        continue
-                                                
-                                    if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                        ptype = "thinking"
-                                    elif "p" in chunk and chunk.get("p") == "response/content":
-                                        ptype = "text"
-            
-                                    # 处理字符串形式的 v 值（即文本内容）
-                                    if isinstance(v_value, str):
-                                        if search_enabled and v_value.startswith("[citation:"):
-                                            continue  # 跳过 citation 内容
-                                        if ptype == "thinking":
-                                            think_list.append(v_value)
-                                        else:
-                                            text_list.append(v_value)
-            
-                                    # 处理数组更新如状态变更
-                                    elif isinstance(v_value, list):
-                                        for item in v_value:
-                                            if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                # 构建最终结果
-                                                final_reasoning = "".join(think_list)
-                                                final_content = "".join(text_list)
-                                                prompt_tokens = len(final_prompt) // 4  # 简单估算token数
-                                                reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
-                                                completion_tokens = len(final_content) // 4  # 简单估算token数
-                                                result = {
-                                                    "id": completion_id,
-                                                    "object": "chat.completion",
-                                                    "created": created_time,
-                                                    "model": model,
-                                                    "choices": [
-                                                        {
-                                                            "index": 0,
-                                                            "message": {
-                                                                "role": "assistant",
-                                                                "content": final_content,
-                                                                "reasoning_content": final_reasoning,
-                                                            },
-                                                            "finish_reason": "stop",
-                                                        }
-                                                    ],
-                                                    "usage": {
-                                                        "prompt_tokens": prompt_tokens,
-                                                        "completion_tokens": reasoning_tokens + completion_tokens,
-                                                        "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                                                        "completion_tokens_details": {
-                                                            "reasoning_tokens": reasoning_tokens
-                                                        },
+                                if "v" not in chunk:
+                                    continue
+
+                                v_value = chunk["v"]
+                                p_value = chunk.get("p", "")
+                                o_value = chunk.get("o", "")
+
+                                # --- 1. 跳过搜索状态 ---
+                                if p_value == "response/search_status":
+                                    continue
+
+                                # --- 2. 检测 FINISHED 结束信号 ---
+                                # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
+                                if "status" in p_value and v_value == "FINISHED":
+                                    # 构建最终结果
+                                    final_reasoning = "".join(think_list)
+                                    final_content = "".join(text_list)
+                                    # 追加文件信息
+                                    if upload_tags["return_fileid"] and uploaded_file_info:
+                                        final_content += f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
+                                    prompt_tokens = len(final_prompt) // 4
+                                    reasoning_tokens = len(final_reasoning) // 4
+                                    completion_tokens = len(final_content) // 4
+                                    result = {
+                                        "id": completion_id,
+                                        "object": "chat.completion",
+                                        "created": created_time,
+                                        "model": model,
+                                        "choices": [
+                                            {
+                                                "index": 0,
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": final_content,
+                                                    "reasoning_content": final_reasoning,
+                                                },
+                                                "finish_reason": "stop",
+                                            }
+                                        ],
+                                        "usage": {
+                                            "prompt_tokens": prompt_tokens,
+                                            "completion_tokens": reasoning_tokens + completion_tokens,
+                                            "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
+                                            "completion_tokens_details": {
+                                                "reasoning_tokens": reasoning_tokens
+                                            },
+                                        },
+                                    }
+                                    data_queue.put("DONE")
+                                    return
+
+                                # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
+                                if isinstance(v_value, list) and p_value:
+                                    is_finished = False
+                                    for item in v_value:
+                                        if isinstance(item, dict) and item.get("v") == "FINISHED":
+                                            is_finished = True
+                                            break
+                                    if is_finished:
+                                        final_reasoning = "".join(think_list)
+                                        final_content = "".join(text_list)
+                                        # 追加文件信息
+                                        if upload_tags["return_fileid"] and uploaded_file_info:
+                                            final_content += f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
+                                        prompt_tokens = len(final_prompt) // 4
+                                        reasoning_tokens = len(final_reasoning) // 4
+                                        completion_tokens = len(final_content) // 4
+                                        result = {
+                                            "id": completion_id,
+                                            "object": "chat.completion",
+                                            "created": created_time,
+                                            "model": model,
+                                            "choices": [
+                                                {
+                                                    "index": 0,
+                                                    "message": {
+                                                        "role": "assistant",
+                                                        "content": final_content,
+                                                        "reasoning_content": final_reasoning,
                                                     },
+                                                    "finish_reason": "stop",
                                                 }
-                                                data_queue.put("DONE")
-                                                return  # 提前返回，结束函数
+                                            ],
+                                            "usage": {
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": reasoning_tokens + completion_tokens,
+                                                "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
+                                                "completion_tokens_details": {
+                                                    "reasoning_tokens": reasoning_tokens
+                                                },
+                                            },
+                                        }
+                                        data_queue.put("DONE")
+                                        return
+
+                                # --- 3. 检测 fragment 类型切换 ---
+                                if p_value == "response/fragments" and isinstance(v_value, list):
+                                    for frag in v_value:
+                                        if isinstance(frag, dict):
+                                            frag_type = frag.get("type", "")
+                                            if frag_type == "THINK":
+                                                ptype = "thinking"
+                                            elif frag_type == "RESPONSE":
+                                                ptype = "text"
+                                    continue
+
+                                # --- 4. 处理初始元数据 ---
+                                if isinstance(v_value, dict):
+                                    resp = v_value.get("response", {})
+                                    if resp:
+                                        fragments = resp.get("fragments", [])
+                                        for frag in fragments:
+                                            if isinstance(frag, dict):
+                                                frag_type = frag.get("type", "")
+                                                if frag_type == "THINK":
+                                                    ptype = "thinking"
+                                                elif frag_type == "RESPONSE":
+                                                    ptype = "text"
+                                    continue
+
+                                # --- 5. 跳过非字符串内容 ---
+                                if not isinstance(v_value, str):
+                                    continue
+
+                                # --- 6. 过滤非内容路径 ---
+                                if p_value:
+                                    if "content" in p_value:
+                                        if p_value == "response/thinking_content":
+                                            ptype = "thinking"
+                                        elif p_value == "response/content":
+                                            ptype = "text"
+                                    else:
+                                        continue
+
+                                # --- 7. 处理文本内容 ---
+                                if search_enabled and v_value.startswith("[citation:"):
+                                    continue
+                                if ptype == "thinking":
+                                    think_list.append(v_value)
+                                else:
+                                    text_list.append(v_value)
             
                             except Exception as e:
                                 logger.warning(f"[collect_data] 无法解析: {data_str}, 错误: {e}")
@@ -1223,6 +1846,9 @@ async def chat_completions(request: Request):
                         # 如果没有提前构造 result，则构造默认结果
                         final_content = "".join(text_list)
                         final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
+                        # 追加文件信息
+                        if upload_tags["return_fileid"] and uploaded_file_info:
+                            final_content += f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
                         prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                         reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
                         completion_tokens = len(final_content) // 4  # 简单估算token数
