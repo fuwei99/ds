@@ -45,7 +45,7 @@ jobs:
   build-and-push:
     needs: semantic-release
     runs-on: ubuntu-latest
-    if: ${{ needs.semantic-release.outputs.new_release_published == 'true' }}
+
     steps:
       - uses: actions/checkout@v2
         with:
@@ -71,9 +71,14 @@ jobs:
       - name: Get version
         id: get_version
         run: |
-          version=${{ needs.semantic-release.outputs.new_release_version }}
-          echo "Current version: v$version"
-          echo "::set-output name=version::v$version"
+          version="${{ needs.semantic-release.outputs.new_release_version }}"
+          if [ -z "$version" ]; then
+            version=$(echo ${{ github.sha }} | cut -c1-7)
+          else
+            version="v$version"
+          fi
+          echo "Current version: $version"
+          echo "::set-output name=version::$version"
 
       - name: Build and push multi-arch images
         uses: docker/build-push-action@v2
