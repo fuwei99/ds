@@ -7,11 +7,29 @@ python app.py &
 if [ ! -f "litellm_config.yaml" ]; then
 cat << 'EOF' > litellm_config.yaml
 model_list:
-  - model_name: my-deepseek-tool
+  - model_name: deepseek-chat
     litellm_params:
       model: openai/deepseek-chat
       api_base: http://127.0.0.1:5001/v1
-      api_key: sk-deepseek2api
+      api_key: wei123..
+      supports_function_calling: true
+  - model_name: deepseek-chat-search
+    litellm_params:
+      model: openai/deepseek-chat-search
+      api_base: http://127.0.0.1:5001/v1
+      api_key: wei123..
+      supports_function_calling: true
+  - model_name: deepseek-reasoner
+    litellm_params:
+      model: openai/deepseek-reasoner
+      api_base: http://127.0.0.1:5001/v1
+      api_key: wei123..
+      supports_function_calling: true
+  - model_name: deepseek-reasoner-search
+    litellm_params:
+      model: openai/deepseek-reasoner-search
+      api_base: http://127.0.0.1:5001/v1
+      api_key: wei123..
       supports_function_calling: true
 EOF
 fi
