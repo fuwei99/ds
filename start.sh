@@ -6,6 +6,9 @@ python app.py &
 # Check if litellm_config.yaml exists, if not create a default one
 if [ ! -f "litellm_config.yaml" ]; then
 cat << 'EOF' > litellm_config.yaml
+litellm_settings:
+  drop_params: true
+
 model_list:
   - model_name: deepseek-chat
     litellm_params:
