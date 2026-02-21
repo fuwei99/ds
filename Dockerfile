@@ -18,13 +18,9 @@ COPY --chown=user . $HOME/app
 
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir 'litellm[proxy]'
 
 # Expose port 7860
 EXPOSE 7860
 
-# Make start.sh executable
-RUN chmod +x start.sh
-
-# Run start.sh when the container launches
-CMD ["./start.sh"]
+# Run app.py when the container launches
+CMD ["python", "app.py"]
