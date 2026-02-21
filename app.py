@@ -89,6 +89,12 @@ def save_config(cfg):
 
 CONFIG = load_config()
 
+# 设置日志级别
+if CONFIG.get("debug_mode", False):
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.setLevel(logging.INFO)
+
 # -------------------------- 全局账号队列 --------------------------
 account_queue = []  # 维护所有可用账号
 claude_api_key_queue = []  # 维护所有可用的Claude API keys
@@ -1747,14 +1753,14 @@ async def chat_completions(request: Request):
                                         new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                 elif ctype == "text":
                                     text_buffer += ctext
-                                    logger.info(f"[tool_detect] 收到文本块: '{ctext[:50]}...' buffer长度={len(text_buffer)}")
+                                    logger.debug(f"[tool_detect] 收到文本块: '{ctext[:50]}...' buffer长度={len(text_buffer)}")
                                     
                                     while len(text_buffer) > 0:
                                         if not in_tool_call:
                                             pos = text_buffer.find("<tool_call>")
                                             if pos != -1:
                                                 before_text = text_buffer[:pos]
-                                                logger.info(f"[tool_detect] ✅ 检测到 <tool_call> at pos={pos}, 前置文本='{before_text[:30]}'")
+                                                logger.debug(f"[tool_detect] ✅ 检测到 <tool_call> at pos={pos}, 前置文本='{before_text[:30]}'")
                                                 if before_text:
                                                     final_text += before_text
                                                     delta_obj = {"content": before_text}
@@ -1785,7 +1791,7 @@ async def chat_completions(request: Request):
                                             pos = text_buffer.find("</tool_call>")
                                             if pos != -1:
                                                 tool_json_str = text_buffer[:pos]
-                                                logger.info(f"[tool_detect] ✅ 检测到 </tool_call>, JSON内容='{tool_json_str.strip()[:80]}'")
+                                                logger.debug(f"[tool_detect] ✅ 检测到 </tool_call>, JSON内容='{tool_json_str.strip()[:80]}'")
                                                 text_buffer = text_buffer[pos + len("</tool_call>"):]
                                                 in_tool_call = False
                                                 
