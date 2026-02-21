@@ -1184,16 +1184,21 @@ def messages_prepare(messages: list) -> str:
     for idx, block in enumerate(merged):
         role = block["role"]
         text = block["text"]
-        if role == "assistant":
-            parts.append(f"<｜Assistant｜>{text}<｜end▁of▁sentence｜>")
-        elif role in ("user", "system"):
-            if idx > 0:
-                parts.append(f"<｜User｜>{text}")
-            else:
-                parts.append(text)
+        
+        if role == "system":
+            parts.append(f"System:\n{text}")
+        elif role == "user":
+            parts.append(f"Human:\n{text}")
+        elif role == "assistant":
+            parts.append(f"Assistant:\n{text}")
         else:
             parts.append(text)
-    final_prompt = "".join(parts)
+            
+    final_prompt = "\n\n".join(parts)
+    
+    # 强制以 Assistant: 结尾，引导模型开始回答
+    if not final_prompt.endswith("Assistant:\n"):
+        final_prompt += "\n\nAssistant:\n"
     # 仅移除 markdown 图片格式(不全部移除 !）
     final_prompt = re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final_prompt)
     return final_prompt
@@ -1202,6 +1207,87 @@ def messages_prepare(messages: list) -> str:
 # 添加保活超时配置（5秒）
 KEEP_ALIVE_TIMEOUT = 5
 
+
+# ----------------------------------------------------------------------
+# (9.5) Tool Calling 转换函数
+# ----------------------------------------------------------------------
+def format_tools_to_system_prompt(tools: list) -> str:
+    if not tools:
+        return ""
+    prompt = "You have access to the following functions/tools. You MUST ONLY use the output format described below if you want to use a tool.\n\n"
+    for t in tools:
+        if t.get("type") == "function":
+            func = t.get("function", {})
+            prompt += f"### Tool: `{func.get('name')}`\n"
+            prompt += f"Description: {func.get('description', '')}\n"
+            prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
+    
+    prompt += """If you want to call a tool, you MUST output a JSON block wrapped in <tool_call> and </tool_call> tags. 
+DO NOT output any other XML tags for tool calls.
+Format:
+<tool_call>
+{"name": "tool_name", "arguments": {"arg1": "value1"}}
+</tool_call>
+
+You can call multiple tools by outputting multiple <tool_call> blocks."""
+    return prompt
+
+def _content_to_str(content) -> str:
+    """将 content 统一转换为字符串（兼容 OpenAI 多模态 list 格式）"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_result":
+                    parts.append(block.get("content", ""))
+                else:
+                    parts.append(str(block))
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+    return str(content)
+
+def process_messages_for_tools(messages: list) -> list:
+    """处理带有 tool_calls 和 tool role 的消息"""
+    new_messages = []
+    for m in messages:
+        msg = dict(m)
+        
+        # 先统一 content 为字符串
+        if "content" in msg:
+            msg["content"] = _content_to_str(msg["content"])
+        
+        # 如果是 assistant 包含了 tool_calls
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            content = msg.get("content") or ""
+            for tc in msg.get("tool_calls"):
+                func = tc.get("function", {})
+                
+                # Handle args correctly, sometimes string sometimes dict
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        pass
+                
+                content += f'\n<tool_call>\n{{"name": "{func.get("name")}", "arguments": {json.dumps(args, ensure_ascii=False)}}}\n</tool_call>\n'
+            msg["content"] = content.strip()
+            
+        # 如果是 tool 结果回复
+        if msg.get("role") == "tool":
+            msg["role"] = "user" # 转成 user 使网页版可以接受
+            tool_content = _content_to_str(msg.get("content"))
+            msg["content"] = f"Tool result for {msg.get('tool_call_id', 'unknown')}:\n{tool_content}"
+            
+        new_messages.append(msg)
+    return new_messages
 
 # ----------------------------------------------------------------------
 # (10) 路由：/v1/chat/completions
@@ -1225,10 +1311,18 @@ async def chat_completions(request: Request):
         req_data = await request.json()
         model = req_data.get("model")
         messages = req_data.get("messages", [])
+        tools = req_data.get("tools", [])
         if not model or not messages:
             raise HTTPException(
                 status_code=400, detail="Request must include 'model' and 'messages'."
             )
+            
+        # ====== Tool Calling 预处理 ======
+        if tools:
+            tool_prompt = format_tools_to_system_prompt(tools)
+            messages.insert(0, {"role": "system", "content": tool_prompt})
+        messages = process_messages_for_tools(messages)
+        # =================================
         # 判断是否启用"思考"或"搜索"功能（这里根据模型名称判断）
         model_lower = model.lower()
         if model_lower in ["deepseek-v3", "deepseek-chat"]:
@@ -1386,6 +1480,12 @@ async def chat_completions(request: Request):
                     result_queue = queue.Queue()
                     last_send_time = time.time()
                     citation_map = {}  # 用于存储引用链接的字典
+                    
+                    # Tool calling buffer state
+                    text_buffer = ""
+                    in_tool_call = False
+                    has_tool_calls_streamed = False
+                    tool_call_index = 0
 
                     def process_data():
                         ptype = "text"
@@ -1560,6 +1660,22 @@ async def chat_completions(request: Request):
                             # 增加 timeout 以便定期发送 keep-alive
                             chunk = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT/2)
                             if chunk is None:
+                                if text_buffer:
+                                    final_text += text_buffer
+                                    if not has_tool_calls_streamed:
+                                        file_info_chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created_time,
+                                            "model": model,
+                                            "choices": [{
+                                                "delta": {"content": text_buffer},
+                                                "index": 0,
+                                                "finish_reason": None,
+                                            }],
+                                        }
+                                        yield f"data: {json.dumps(file_info_chunk, ensure_ascii=False)}\n\n"
+                                
                                 # 如果需要返回文件ID，在结束前追加文件信息
                                 if upload_tags["return_fileid"] and uploaded_file_info:
                                     file_tag = f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
@@ -1598,7 +1714,7 @@ async def chat_completions(request: Request):
                                         {
                                             "delta": {},
                                             "index": 0,
-                                            "finish_reason": "stop",
+                                            "finish_reason": "tool_calls" if has_tool_calls_streamed else "stop",
                                         }
                                     ],
                                     "usage": usage,
@@ -1620,27 +1736,95 @@ async def chat_completions(request: Request):
                                     ctext = '服务器繁忙，请稍候再试'
                                 if search_enabled and ctext.startswith("[citation:"):
                                     ctext = ""
+                                    
                                 if ctype == "thinking":
                                     if thinking_enabled:
                                         final_thinking += ctext
+                                        delta_obj = {"reasoning_content": ctext}
+                                        if not first_chunk_sent:
+                                            delta_obj["role"] = "assistant"
+                                            first_chunk_sent = True
+                                        new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                 elif ctype == "text":
-                                    final_text += ctext
-                                delta_obj = {}
-                                if not first_chunk_sent:
-                                    delta_obj["role"] = "assistant"
-                                    first_chunk_sent = True
-                                if ctype == "thinking":
-                                    if thinking_enabled:
-                                        delta_obj["reasoning_content"] = ctext
-                                elif ctype == "text":
-                                    delta_obj["content"] = ctext
-                                if delta_obj:
-                                    new_choices.append(
-                                        {
-                                            "delta": delta_obj,
-                                            "index": choice.get("index", 0),
-                                        }
-                                    )
+                                    text_buffer += ctext
+                                    logger.info(f"[tool_detect] 收到文本块: '{ctext[:50]}...' buffer长度={len(text_buffer)}")
+                                    
+                                    while len(text_buffer) > 0:
+                                        if not in_tool_call:
+                                            pos = text_buffer.find("<tool_call>")
+                                            if pos != -1:
+                                                before_text = text_buffer[:pos]
+                                                logger.info(f"[tool_detect] ✅ 检测到 <tool_call> at pos={pos}, 前置文本='{before_text[:30]}'")
+                                                if before_text:
+                                                    final_text += before_text
+                                                    delta_obj = {"content": before_text}
+                                                    if not first_chunk_sent:
+                                                        delta_obj["role"] = "assistant"
+                                                        first_chunk_sent = True
+                                                    new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                                in_tool_call = True
+                                                text_buffer = text_buffer[pos + len("<tool_call>"):]
+                                            else:
+                                                # Check if ending might be <tool_call> prefix
+                                                safe_len = len(text_buffer)
+                                                for i in range(1, len("<tool_call>")):
+                                                    if text_buffer.endswith("<tool_call>"[:i]):
+                                                        safe_len -= i
+                                                        break
+                                                safe_text = text_buffer[:safe_len]
+                                                text_buffer = text_buffer[safe_len:]
+                                                if safe_text:
+                                                    final_text += safe_text
+                                                    delta_obj = {"content": safe_text}
+                                                    if not first_chunk_sent:
+                                                        delta_obj["role"] = "assistant"
+                                                        first_chunk_sent = True
+                                                    new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                                break # Wait for more data
+                                        else:
+                                            pos = text_buffer.find("</tool_call>")
+                                            if pos != -1:
+                                                tool_json_str = text_buffer[:pos]
+                                                logger.info(f"[tool_detect] ✅ 检测到 </tool_call>, JSON内容='{tool_json_str.strip()[:80]}'")
+                                                text_buffer = text_buffer[pos + len("</tool_call>"):]
+                                                in_tool_call = False
+                                                
+                                                try:
+                                                    parsed = json.loads(tool_json_str.strip())
+                                                    t_name = parsed.get("name", "")
+                                                    t_args = parsed.get("arguments", "{}")
+                                                    if isinstance(t_args, dict):
+                                                        t_args = json.dumps(t_args, ensure_ascii=False)
+                                                    elif not isinstance(t_args, str):
+                                                        t_args = str(t_args)
+                                                    
+                                                    delta_obj = {
+                                                        "tool_calls": [{
+                                                            "index": tool_call_index,
+                                                            "id": f"call_{tool_call_index}_{int(time.time())}",
+                                                            "type": "function",
+                                                            "function": {
+                                                                "name": t_name,
+                                                                "arguments": t_args
+                                                            }
+                                                        }]
+                                                    }
+                                                    if not first_chunk_sent:
+                                                        delta_obj["role"] = "assistant"
+                                                        first_chunk_sent = True
+                                                    new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                                    has_tool_calls_streamed = True
+                                                    tool_call_index += 1
+                                                except Exception as e:
+                                                    logger.warning(f"Failed to parse tool call json: {e}")
+                                                    delta_obj = {"content": f"\n<tool_call>{tool_json_str}</tool_call>\n"}
+                                                    final_text += delta_obj["content"]
+                                                    if not first_chunk_sent:
+                                                        delta_obj["role"] = "assistant"
+                                                        first_chunk_sent = True
+                                                    new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                            else:
+                                                break # Wait for ending tag
                             if new_choices:
                                 out_chunk = {
                                     "id": completion_id,
@@ -1715,42 +1899,7 @@ async def chat_completions(request: Request):
                                 # --- 2. 检测 FINISHED 结束信号 ---
                                 # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
                                 if "status" in p_value and v_value == "FINISHED":
-                                    # 构建最终结果
-                                    final_reasoning = "".join(think_list)
-                                    final_content = "".join(text_list)
-                                    # 追加文件信息
-                                    if upload_tags["return_fileid"] and uploaded_file_info:
-                                        final_content += f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
-                                    prompt_tokens = len(final_prompt) // 4
-                                    reasoning_tokens = len(final_reasoning) // 4
-                                    completion_tokens = len(final_content) // 4
-                                    result = {
-                                        "id": completion_id,
-                                        "object": "chat.completion",
-                                        "created": created_time,
-                                        "model": model,
-                                        "choices": [
-                                            {
-                                                "index": 0,
-                                                "message": {
-                                                    "role": "assistant",
-                                                    "content": final_content,
-                                                    "reasoning_content": final_reasoning,
-                                                },
-                                                "finish_reason": "stop",
-                                            }
-                                        ],
-                                        "usage": {
-                                            "prompt_tokens": prompt_tokens,
-                                            "completion_tokens": reasoning_tokens + completion_tokens,
-                                            "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                                            "completion_tokens_details": {
-                                                "reasoning_tokens": reasoning_tokens
-                                            },
-                                        },
-                                    }
-                                    data_queue.put("DONE")
-                                    return
+                                    break
 
                                 # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
                                 if isinstance(v_value, list) and p_value:
@@ -1760,41 +1909,7 @@ async def chat_completions(request: Request):
                                             is_finished = True
                                             break
                                     if is_finished:
-                                        final_reasoning = "".join(think_list)
-                                        final_content = "".join(text_list)
-                                        # 追加文件信息
-                                        if upload_tags["return_fileid"] and uploaded_file_info:
-                                            final_content += f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
-                                        prompt_tokens = len(final_prompt) // 4
-                                        reasoning_tokens = len(final_reasoning) // 4
-                                        completion_tokens = len(final_content) // 4
-                                        result = {
-                                            "id": completion_id,
-                                            "object": "chat.completion",
-                                            "created": created_time,
-                                            "model": model,
-                                            "choices": [
-                                                {
-                                                    "index": 0,
-                                                    "message": {
-                                                        "role": "assistant",
-                                                        "content": final_content,
-                                                        "reasoning_content": final_reasoning,
-                                                    },
-                                                    "finish_reason": "stop",
-                                                }
-                                            ],
-                                            "usage": {
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": reasoning_tokens + completion_tokens,
-                                                "total_tokens": prompt_tokens + reasoning_tokens + completion_tokens,
-                                                "completion_tokens_details": {
-                                                    "reasoning_tokens": reasoning_tokens
-                                                },
-                                            },
-                                        }
-                                        data_queue.put("DONE")
-                                        return
+                                        break
 
                                 # --- 3. 检测 fragment 类型切换 ---
                                 if p_value == "response/fragments" and isinstance(v_value, list):
@@ -1866,12 +1981,58 @@ async def chat_completions(request: Request):
                         # 如果没有提前构造 result，则构造默认结果
                         final_content = "".join(text_list)
                         final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
+                        
+                        # --- 检测并解析 tool_calls ---
+                        tool_calls = []
+                        
+                        while "<tool_call>" in final_content and "</tool_call>" in final_content:
+                            start_idx = final_content.find("<tool_call>")
+                            end_idx = final_content.find("</tool_call>", start_idx)
+                            if end_idx == -1:
+                                break
+                            
+                            json_str = final_content[start_idx + len("<tool_call>"):end_idx].strip()
+                            
+                            try:
+                                parsed = json.loads(json_str)
+                                args = parsed.get("arguments", "{}")
+                                if isinstance(args, dict):
+                                    args = json.dumps(args, ensure_ascii=False)
+                                elif not isinstance(args, str):
+                                    args = str(args)
+                                    
+                                tool_calls.append({
+                                    "id": f"call_{len(tool_calls)}_{int(time.time())}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": parsed.get("name", ""),
+                                        "arguments": args
+                                    }
+                                })
+                            except Exception as e:
+                                logger.warning(f"解析 tool_call 失败: {json_str}, error: {e}")
+                                
+                            # 移除这部分 tool_call
+                            final_content = final_content[:start_idx] + final_content[end_idx + len("</tool_call>"):]
+                        
+                        final_content = final_content.strip()
+
                         # 追加文件信息
                         if upload_tags["return_fileid"] and uploaded_file_info:
                             final_content += f"\n---\n<||file:{uploaded_file_info['name']}:{uploaded_file_info['id']}||>"
+                            
                         prompt_tokens = len(final_prompt) // 4  # 简单估算token数
                         reasoning_tokens = len(final_reasoning) // 4  # 简单估算token数
                         completion_tokens = len(final_content) // 4  # 简单估算token数
+                        
+                        message_obj = {
+                            "role": "assistant",
+                            "content": final_content,
+                            "reasoning_content": final_reasoning,
+                        }
+                        if tool_calls:
+                            message_obj["tool_calls"] = tool_calls
+                            
                         result = {
                             "id": completion_id,
                             "object": "chat.completion",
@@ -1880,12 +2041,8 @@ async def chat_completions(request: Request):
                             "choices": [
                                 {
                                     "index": 0,
-                                    "message": {
-                                        "role": "assistant",
-                                        "content": final_content,
-                                        "reasoning_content": final_reasoning,
-                                    },
-                                    "finish_reason": "stop",
+                                    "message": message_obj,
+                                    "finish_reason": "tool_calls" if tool_calls else "stop",
                                 }
                             ],
                             "usage": {

@@ -9,15 +9,3 @@ services:
       - "5001:5001"
     volumes:
       - "./config.json:/app/config.json"
-      
-  litellm:
-    container_name: litellm_proxy
-    image: ghcr.io/berriai/litellm:main-latest
-    restart: always
-    ports:
-      - "4000:4000"
-    volumes:
-      - "./litellm_config.yaml:/app/config.yaml"
-    command: [ "--config", "/app/config.yaml", "--port", "4000", "--num_workers", "8" ]
-    depends_on:
-      - deepseek2api
