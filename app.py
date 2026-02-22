@@ -1196,7 +1196,7 @@ def messages_prepare(messages: list) -> str:
         elif role == "user":
             parts.append(f"Human:\n{text}")
         elif role == "assistant":
-            parts.append(f"Assistant:\n{text}")
+            parts.append(f"Assistant:\n{text}<｜end▁of▁sentence｜>")
         else:
             parts.append(text)
             
