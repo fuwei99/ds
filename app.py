@@ -747,6 +747,25 @@ def convert_deepseek_to_claude_format(deepseek_response, original_claude_model=C
 
 
 # ----------------------------------------------------------------------
+# 模型参数解析助手
+# ----------------------------------------------------------------------
+def resolve_model_params(model_name: str):
+    """根据模型名称解析 thinking, search 和 model_type"""
+    model_lower = model_name.lower()
+    
+    # 1. Thinking / Reasoner (r1, reasoner -> True; v3, chat -> False)
+    thinking_enabled = "reasoner" in model_lower or "r1" in model_lower
+    
+    # 2. Search
+    search_enabled = "search" in model_lower
+    
+    # 3. Model Type (default / expert)
+    model_type = "expert" if "expert" in model_lower else "default"
+    
+    return thinking_enabled, search_enabled, model_type
+
+
+# ----------------------------------------------------------------------
 # Claude API 调用函数
 # ----------------------------------------------------------------------
 async def call_claude_via_openai(request: Request, claude_payload):
@@ -772,23 +791,8 @@ async def call_claude_via_openai(request: Request, claude_payload):
         model = deepseek_payload.get("model", "deepseek-chat")
         messages = deepseek_payload.get("messages", [])
         
-        # 判断模型特性
-        model_lower = model.lower()
-        if model_lower in ["deepseek-v3", "deepseek-chat"]:
-            thinking_enabled = False
-            search_enabled = False
-        elif model_lower in ["deepseek-r1", "deepseek-reasoner"]:
-            thinking_enabled = True
-            search_enabled = False
-        elif model_lower in ["deepseek-v3-search", "deepseek-chat-search"]:
-            thinking_enabled = False
-            search_enabled = True
-        elif model_lower in ["deepseek-r1-search", "deepseek-reasoner-search"]:
-            thinking_enabled = True
-            search_enabled = True
-        else:
-            thinking_enabled = False
-            search_enabled = False
+        # 解析模型参数
+        thinking_enabled, search_enabled, model_type = resolve_model_params(model)
         
         # 使用 messages_prepare 函数构造最终 prompt
         final_prompt = messages_prepare(messages)
@@ -801,10 +805,12 @@ async def call_claude_via_openai(request: Request, claude_payload):
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "model_type": model_type,
         }
 
         deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
         return deepseek_resp
+
         
     except Exception as e:
         logger.error(f"[call_claude_via_openai] 调用失败: {e}")
@@ -1092,37 +1098,23 @@ def get_pow_response(request: Request, max_attempts=3):
 @app.get("/v1/models")
 def list_models():
     models_list = [
-        {
-            "id": "deepseek-chat",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-reasoner",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-chat-search",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-reasoner-search",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
+        # Chat Models
+        {"id": "deepseek-chat", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-v3", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-chat-expert", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-chat-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-chat-expert-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        
+        # Reasoner Models
+        {"id": "deepseek-reasoner", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-r1", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-reasoner-expert", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-reasoner-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-reasoner-expert-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
     ]
     data = {"object": "list", "data": models_list}
     return JSONResponse(content=data, status_code=200)
+
 
 
 # ----------------------------------------------------------------------
@@ -1329,24 +1321,9 @@ async def chat_completions(request: Request):
             messages.insert(0, {"role": "system", "content": tool_prompt})
         messages = process_messages_for_tools(messages)
         # =================================
-        # 判断是否启用"思考"或"搜索"功能（这里根据模型名称判断）
-        model_lower = model.lower()
-        if model_lower in ["deepseek-v3", "deepseek-chat"]:
-            thinking_enabled = False
-            search_enabled = False
-        elif model_lower in ["deepseek-r1", "deepseek-reasoner"]:
-            thinking_enabled = True
-            search_enabled = False
-        elif model_lower in ["deepseek-v3-search", "deepseek-chat-search"]:
-            thinking_enabled = False
-            search_enabled = True
-        elif model_lower in ["deepseek-r1-search", "deepseek-reasoner-search"]:
-            thinking_enabled = True
-            search_enabled = True
-        else:
-            raise HTTPException(
-                status_code=503, detail=f"Model '{model}' is not available."
-            )
+        # 判断是否启用"思考"或"搜索"功能以及模型类型（这里根据模型名称解析）
+        thinking_enabled, search_enabled, model_type = resolve_model_params(model)
+
         # ====== 解析标签 & 文件上传决策 ======
         # 1. 先解析标签（会修改 messages，清除标签内容）
         upload_tags = parse_upload_tags(messages)
@@ -1462,7 +1439,9 @@ async def chat_completions(request: Request):
             "ref_file_ids": ref_file_ids,
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "model_type": model_type,
         }
+
 
         deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
         if not deepseek_resp:
