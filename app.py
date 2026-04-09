@@ -126,15 +126,18 @@ DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_chall
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 BASE_HEADERS = {
     "Host": "chat.deepseek.com",
-    "User-Agent": "DeepSeek/1.0.13 Android/35",
-    "Accept": "application/json",
-    "Accept-Encoding": "gzip",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "zh,en-US;q=0.9,en;q=0.8,zh-CN;q=0.7",
     "Content-Type": "application/json",
-    "x-client-platform": "android",
-    "x-client-version": "1.3.0-auto-resume",
+    "x-client-platform": "web",
+    "x-client-version": "1.8.0",
+    "x-app-version": "20241129.1",
     "x-client-locale": "zh_CN",
-    "accept-charset": "UTF-8",
+    "x-client-timezone-offset": "28800",
 }
+
 
 # ----------------------------------------------------------------------
 # (2.1) Claude 相关常量 - 基于OpenAI接口转换
@@ -171,18 +174,21 @@ def login_deepseek_via_account(account):
     if email:
         payload = {
             "email": email,
+            "mobile": "",
             "password": password,
+            "area_code": "",
             "device_id": "deepseek_to_api",
-            "os": "android",
+            "os": "web",
         }
     else:
         payload = {
             "mobile": mobile,
-            "area_code": None,
+            "area_code": "",
             "password": password,
             "device_id": "deepseek_to_api",
-            "os": "android",
+            "os": "web",
         }
+
     try:
         resp = requests.post(DEEPSEEK_LOGIN_URL, headers=BASE_HEADERS, json=payload, impersonate="safari15_3")
         resp.raise_for_status()
@@ -872,7 +878,12 @@ def create_session(request: Request, max_attempts=3):
             logger.error(f"[create_session] JSON解析异常: {e}")
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
-            session_id = data["data"]["biz_data"]["id"]
+            biz_data = data.get("data", {}).get("biz_data", {})
+            session_id = biz_data.get("chat_session", {}).get("id")
+            if not session_id:
+                # 兼容旧版本结构或备选方案
+                session_id = biz_data.get("id")
+
 
             resp.close()
             return session_id
@@ -1026,7 +1037,13 @@ def get_pow_response(request: Request, max_attempts=3):
             logger.error(f"[get_pow_response] JSON解析异常: {e}")
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
-            challenge = data["data"]["biz_data"]["challenge"]
+            biz_data = data.get("data", {}).get("biz_data", {})
+            pow_challenge = biz_data.get("pow_challenge", {})
+            challenge = pow_challenge.get("challenge")
+            if not challenge:
+                # 兼容旧版本结构
+                challenge = biz_data.get("challenge")
+
             difficulty = challenge.get("difficulty", 144000)
             expire_at = challenge.get("expire_at", 1680000000)
             try:
@@ -1514,21 +1531,22 @@ async def chat_completions(request: Request):
 
                                         # --- 2. 检测 FINISHED 结束信号 ---
                                         # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
-                                        if "status" in p_value and v_value == "FINISHED":
+                                        if (p_value == "response/status" or p_value == "status") and v_value == "FINISHED":
                                             result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
                                             result_queue.put(None)
                                             return
                                         # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
-                                        if isinstance(v_value, list) and p_value:
+                                        if isinstance(v_value, list) and p_value == "response":
                                             is_finished = False
                                             for item in v_value:
-                                                if isinstance(item, dict) and item.get("v") == "FINISHED":
+                                                if isinstance(item, dict) and item.get("p") == "quasi_status" and item.get("v") == "FINISHED":
                                                     is_finished = True
                                                     break
                                             if is_finished:
                                                 result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
                                                 result_queue.put(None)
                                                 return
+
                                             # 非 FINISHED 的 list（如 fragment 切换），继续判断
                                         
                                         # --- 3. 检测 fragment 类型切换 ---
@@ -1541,7 +1559,25 @@ async def chat_completions(request: Request):
                                                         ptype = "thinking"
                                                     elif frag_type == "RESPONSE":
                                                         ptype = "text"
+                                                    
+                                                    # --- 提取片段自带的初始内容 ---
+                                                    frag_content = frag.get("content", "")
+                                                    if frag_content:
+                                                        error_type = "thinking" if ptype == "thinking" else "text"
+                                                        fake_chunk = {
+                                                            "choices": [
+                                                                {
+                                                                    "index": 0,
+                                                                    "delta": {
+                                                                        "content": frag_content,
+                                                                        "type": error_type
+                                                                    }
+                                                                }
+                                                            ]
+                                                        }
+                                                        result_queue.put(fake_chunk)
                                             continue
+
 
                                         # --- 4. 处理初始元数据 ---
                                         # 形式: {"v":{"response":{...,"fragments":[{"type":"THINK",...}],...}}}
@@ -1556,7 +1592,25 @@ async def chat_completions(request: Request):
                                                             ptype = "thinking"
                                                         elif frag_type == "RESPONSE":
                                                             ptype = "text"
+                                                        
+                                                        # --- 提取初始内容 ---
+                                                        initial_content = frag.get("content", "")
+                                                        if initial_content:
+                                                            error_type = "thinking" if ptype == "thinking" else "text"
+                                                            fake_chunk = {
+                                                                "choices": [
+                                                                    {
+                                                                        "index": 0,
+                                                                        "delta": {
+                                                                            "content": initial_content,
+                                                                            "type": error_type
+                                                                        }
+                                                                    }
+                                                                ]
+                                                            }
+                                                            result_queue.put(fake_chunk)
                                             continue
+
 
                                         # --- 5. 跳过非字符串内容（如 elapsed_secs 等数值） ---
                                         if not isinstance(v_value, str):
@@ -1883,18 +1937,19 @@ async def chat_completions(request: Request):
 
                                 # --- 2. 检测 FINISHED 结束信号 ---
                                 # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
-                                if "status" in p_value and v_value == "FINISHED":
+                                if (p_value == "response/status" or p_value == "status") and v_value == "FINISHED":
                                     break
 
                                 # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
-                                if isinstance(v_value, list) and p_value:
+                                if isinstance(v_value, list) and p_value == "response":
                                     is_finished = False
                                     for item in v_value:
-                                        if isinstance(item, dict) and item.get("v") == "FINISHED":
+                                        if isinstance(item, dict) and item.get("p") == "quasi_status" and item.get("v") == "FINISHED":
                                             is_finished = True
                                             break
                                     if is_finished:
                                         break
+
 
                                 # --- 3. 检测 fragment 类型切换 ---
                                 if p_value == "response/fragments" and isinstance(v_value, list):
@@ -1905,7 +1960,16 @@ async def chat_completions(request: Request):
                                                 ptype = "thinking"
                                             elif frag_type == "RESPONSE":
                                                 ptype = "text"
+                                            
+                                            # --- 提取片段自带的初始内容 ---
+                                            frag_content = frag.get("content", "")
+                                            if frag_content:
+                                                if ptype == "thinking":
+                                                    think_list.append(frag_content)
+                                                else:
+                                                    text_list.append(frag_content)
                                     continue
+
 
                                 # --- 4. 处理初始元数据 ---
                                 if isinstance(v_value, dict):
@@ -1919,7 +1983,16 @@ async def chat_completions(request: Request):
                                                     ptype = "thinking"
                                                 elif frag_type == "RESPONSE":
                                                     ptype = "text"
+                                                
+                                                # --- 提取初始内容 ---
+                                                initial_content = frag.get("content", "")
+                                                if initial_content:
+                                                    if ptype == "thinking":
+                                                        think_list.append(initial_content)
+                                                    else:
+                                                        text_list.append(initial_content)
                                     continue
+
 
                                 # --- 5. 跳过非字符串内容 ---
                                 if not isinstance(v_value, str):
