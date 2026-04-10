@@ -1559,6 +1559,9 @@ async def chat_completions(request: Request):
                                                         ptype = "thinking"
                                                     elif frag_type == "RESPONSE":
                                                         ptype = "text"
+                                                    else:
+                                                        # 跳过其他类型片段，如 "TIP" (免责声明)
+                                                        continue
                                                     
                                                     # --- 提取片段自带的初始内容 ---
                                                     frag_content = frag.get("content", "")
@@ -1592,6 +1595,9 @@ async def chat_completions(request: Request):
                                                             ptype = "thinking"
                                                         elif frag_type == "RESPONSE":
                                                             ptype = "text"
+                                                        else:
+                                                            # 跳过初次碎片中的非内容片段
+                                                            continue
                                                         
                                                         # --- 提取初始内容 ---
                                                         initial_content = frag.get("content", "")
@@ -1960,6 +1966,9 @@ async def chat_completions(request: Request):
                                                 ptype = "thinking"
                                             elif frag_type == "RESPONSE":
                                                 ptype = "text"
+                                            else:
+                                                # 非流式模式同样过滤 TIP 片段
+                                                continue
                                             
                                             # --- 提取片段自带的初始内容 ---
                                             frag_content = frag.get("content", "")
@@ -1983,6 +1992,9 @@ async def chat_completions(request: Request):
                                                     ptype = "thinking"
                                                 elif frag_type == "RESPONSE":
                                                     ptype = "text"
+                                                else:
+                                                    # 过滤初始元数据中的非内容片段
+                                                    continue
                                                 
                                                 # --- 提取初始内容 ---
                                                 initial_content = frag.get("content", "")
@@ -2771,7 +2783,7 @@ async def claude_count_tokens(request: Request):
 # ----------------------------------------------------------------------
 @app.get("/")
 def index(request: Request):
-    return templates.TemplateResponse("welcome.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="welcome.html")
 
 
 # ----------------------------------------------------------------------
