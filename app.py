@@ -1342,9 +1342,10 @@ async def chat_completions(request: Request):
         upload_tags = parse_upload_tags(messages)
         
         forced_email = None
-        if upload_tags.get("reupload") and CONFIG.get("file_reuse_account"):
+        # 当且仅当消息中包含具体的文件引用时，才锁定专用账号，以确保文件 ID 有效
+        if upload_tags.get("existing_files") and CONFIG.get("file_reuse_account"):
             forced_email = CONFIG["file_reuse_account"]
-            logger.info(f"[chat_completions] 检测到文件复用标签，尝试锁定专用账号: {forced_email}")
+            logger.info(f"[chat_completions] 检测到具体的历史文件引用，锁定专用账号: {forced_email}")
 
         # 3. 处理 token 相关逻辑，此时已知是否需要特定账号
         try:
