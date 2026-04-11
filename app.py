@@ -906,23 +906,49 @@ def create_session(request: Request, max_attempts=3):
             )
             resp.close()
             if request.state.use_config_token:
-                current_id = get_account_identifier(request.state.account)
+                current_acc = request.state.account
+                current_id = get_account_identifier(current_acc)
+                
+                # 1. 清除失效的 Token
+                if current_acc:
+                    current_acc["token"] = ""
+                    logger.info(f"[create_session] 账号 {current_id} Token 已失效，已将其清空")
+
+                # 2. 如果是“被点名”的固定账号，尝试原地救活，而不是直接换人
+                # 检查是否是 file_reuse_account 或者是当前请求强制指定的账号
+                forced_email = CONFIG.get("file_reuse_account")
+                if current_acc and current_acc.get("email") == forced_email:
+                    logger.info(f"[create_session] 专用账号 {current_id} 失效，尝试原地刷新 Token...")
+                    try:
+                        new_token = login_deepseek_via_account(current_acc)
+                        request.state.deepseek_token = new_token
+                        attempts += 1 # 增加尝试次数但保持使用当前账号
+                        logger.info(f"[create_session] 专用账号 {current_id} 原地刷新成功，准备重试")
+                        continue
+                    except Exception as e:
+                        logger.error(f"[create_session] 专用账号原地刷新失败: {e}，将尝试切换其他账号")
+
+                # 3. 如果不是固定账号或原地刷新失败，再走常规换号逻辑
                 if not hasattr(request.state, "tried_accounts"):
                     request.state.tried_accounts = []
                 if current_id not in request.state.tried_accounts:
                     request.state.tried_accounts.append(current_id)
+
                 new_account = choose_new_account(request.state.tried_accounts)
                 if new_account is None:
                     break
                 try:
-                    login_deepseek_via_account(new_account)
+                    # 登录新账号并更新全局状态
+                    new_token = login_deepseek_via_account(new_account)
+                    request.state.account = new_account
+                    request.state.deepseek_token = new_token
+                    logger.info(f"[create_session] 已切换并登录新账号: {get_account_identifier(new_account)}")
                 except Exception as e:
                     logger.error(
                         f"[create_session] 账号 {get_account_identifier(new_account)} 登录失败：{e}"
                     )
                     attempts += 1
                     continue
-                request.state.account = new_account
                 request.state.deepseek_token = new_account.get("token")
             else:
                 attempts += 1
@@ -1096,24 +1122,47 @@ def get_pow_response(request: Request, max_attempts=3):
             )
             resp.close()
             if request.state.use_config_token:
-                current_id = get_account_identifier(request.state.account)
+                current_acc = request.state.account
+                current_id = get_account_identifier(current_acc)
+                
+                # 1. 清除失效的 Token
+                if current_acc:
+                    current_acc["token"] = ""
+                    logger.info(f"[get_pow_response] 账号 {current_id} Token 已失效，已将其清空")
+
+                # 2. 如果是“被点名”的固定账号，尝试原地救活
+                forced_email = CONFIG.get("file_reuse_account")
+                if current_acc and current_acc.get("email") == forced_email:
+                    logger.info(f"[get_pow_response] 专用账号 {current_id} 失效，尝试原地刷新 Token...")
+                    try:
+                        new_token = login_deepseek_via_account(current_acc)
+                        request.state.deepseek_token = new_token
+                        attempts += 1
+                        logger.info(f"[get_pow_response] 专用账号 {current_id} 原地刷新成功，准备重试")
+                        continue
+                    except Exception as e:
+                        logger.error(f"[get_pow_response] 专用账号原地刷新失败: {e}，将尝试切换其他账号")
+
+                # 3. 常规换号逻辑
                 if not hasattr(request.state, "tried_accounts"):
                     request.state.tried_accounts = []
                 if current_id not in request.state.tried_accounts:
                     request.state.tried_accounts.append(current_id)
+
                 new_account = choose_new_account(request.state.tried_accounts)
                 if new_account is None:
                     break
                 try:
-                    login_deepseek_via_account(new_account)
+                    new_token = login_deepseek_via_account(new_account)
+                    request.state.account = new_account
+                    request.state.deepseek_token = new_token
+                    logger.info(f"[get_pow_response] 已切换并登录新账号: {get_account_identifier(new_account)}")
                 except Exception as e:
                     logger.error(
                         f"[get_pow_response] 账号 {get_account_identifier(new_account)} 登录失败：{e}"
                     )
                     attempts += 1
                     continue
-                request.state.account = new_account
-                request.state.deepseek_token = new_account.get("token")
             else:
                 attempts += 1
                 continue
