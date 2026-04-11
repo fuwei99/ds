@@ -1585,85 +1585,23 @@ async def chat_completions(request: Request):
                                                         ptype = "thinking"
                                                     elif p == "response/content":
                                                         ptype = "text"
-                                            continue
+                                                    
+                                                    # 过滤搜索引导语
+                                                    if search_enabled and v.startswith("[citation:"):
+                                                        return False
+                                                    
+                                                    result_queue.put({
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {"content": v, "type": ptype}
+                                                        }]
+                                                    })
+                                            return False
 
+                                        # 执行解析
+                                        if process_packet(chunk):
+                                            return
 
-                                        # --- 4. 处理初始元数据 ---
-                                        # 形式: {"v":{"response":{...,"fragments":[{"type":"THINK",...}],...}}}
-                                        if isinstance(v_value, dict):
-                                            resp = v_value.get("response", {})
-                                            if resp:
-                                                fragments = resp.get("fragments", [])
-                                                for frag in fragments:
-                                                    if isinstance(frag, dict):
-                                                        frag_type = frag.get("type", "")
-                                                        if frag_type == "THINK":
-                                                            ptype = "thinking"
-                                                        elif frag_type == "RESPONSE":
-                                                            ptype = "text"
-                                                        else:
-                                                            # 跳过初次碎片中的非内容片段
-                                                            continue
-                                                        
-                                                        # --- 提取初始内容 ---
-                                                        initial_content = frag.get("content", "")
-                                                        if initial_content:
-                                                            error_type = "thinking" if ptype == "thinking" else "text"
-                                                            fake_chunk = {
-                                                                "choices": [
-                                                                    {
-                                                                        "index": 0,
-                                                                        "delta": {
-                                                                            "content": initial_content,
-                                                                            "type": error_type
-                                                                        }
-                                                                    }
-                                                                ]
-                                                            }
-                                                            result_queue.put(fake_chunk)
-                                            continue
-
-
-                                        # --- 5. 跳过非字符串内容（如 elapsed_secs 等数值） ---
-                                        if not isinstance(v_value, str):
-                                            continue
-
-                                        # --- 6. 跳过非内容路径的字符串 ---
-                                        # 只有以下情况才是真正的文本内容：
-                                        #   a) 无 p 字段的裸块: {"v":"..."}
-                                        #   b) fragment 内容追加: {"p":"response/fragments/-1/content",...}
-                                        #   c) 旧协议兼容: {"p":"response/thinking_content",...} 或 {"p":"response/content",...}
-                                        if p_value:
-                                            if "content" in p_value:
-                                                # 内容路径，兼容旧协议的类型切换
-                                                if p_value == "response/thinking_content":
-                                                    ptype = "thinking"
-                                                elif p_value == "response/content":
-                                                    ptype = "text"
-                                                # "response/fragments/-1/content" 保持当前 ptype
-                                            else:
-                                                # 非内容路径的字符串（如未知字段），跳过
-                                                continue
-
-                                        content = v_value
-
-                                        # 构造兼容原逻辑的 chunk
-                                        unified_chunk = {
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {
-                                                    "content": content,
-                                                    "type": ptype
-                                                }
-                                            }],
-                                            "model": "",
-                                            "chunk_token_usage": len(content) // 4,
-                                            "created": 0,
-                                            "message_id": -1,
-                                            "parent_id": -1
-                                        }
-                    
-                                        result_queue.put(unified_chunk)
                                     except Exception as e:
                                         logger.warning(
                                             f"[sse_stream] 无法解析: {data_str}, 错误: {e}"
