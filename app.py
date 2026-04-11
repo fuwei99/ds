@@ -1518,67 +1518,73 @@ async def chat_completions(request: Request):
                                     try:
                                         chunk = json.loads(data_str)
                                         
-                                        if "v" not in chunk:
-                                            continue
-                                        
-                                        v_value = chunk["v"]
-                                        p_value = chunk.get("p", "")
-                                        o_value = chunk.get("o", "")
+                                        # --- 定义核心解析逻辑以支持递归 BATCH 和 Fragment 提取 ---
+                                        def process_frag(frag):
+                                            nonlocal ptype
+                                            if not isinstance(frag, dict): return
+                                            
+                                            f_type = frag.get("type", "")
+                                            if f_type == "THINK":
+                                                ptype = "thinking"
+                                            elif f_type == "RESPONSE":
+                                                ptype = "text"
+                                            
+                                            # 提取片段自带的初始内容
+                                            f_content = frag.get("content", "")
+                                            if f_content:
+                                                result_queue.put({
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {"content": f_content, "type": ptype}
+                                                    }]
+                                                })
 
-                                        # --- 1. 跳过搜索状态 ---
-                                        if p_value == "response/search_status":
-                                            continue
+                                        def process_packet(packet):
+                                            nonlocal ptype
+                                            p = packet.get("p", "")
+                                            o = packet.get("o", "")
+                                            v = packet.get("v")
 
-                                        # --- 2. 检测 FINISHED 结束信号 ---
-                                        # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
-                                        if (p_value == "response/status" or p_value == "status") and v_value == "FINISHED":
-                                            result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                            result_queue.put(None)
-                                            return
-                                        # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
-                                        if isinstance(v_value, list) and p_value == "response":
-                                            is_finished = False
-                                            for item in v_value:
-                                                if isinstance(item, dict) and item.get("p") == "quasi_status" and item.get("v") == "FINISHED":
-                                                    is_finished = True
-                                                    break
-                                            if is_finished:
+                                            # 1. 检测结束信号 (FINISHED)
+                                            if (p == "response/status" or p == "status" or p == "quasi_status") and v == "FINISHED":
                                                 result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
                                                 result_queue.put(None)
-                                                return
+                                                return True # 信号：需要终止外部循环
 
-                                            # 非 FINISHED 的 list（如 fragment 切换），继续判断
-                                        
-                                        # --- 3. 检测 fragment 类型切换 ---
-                                        # 形式: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE",...}]}
-                                        if p_value == "response/fragments" and isinstance(v_value, list):
-                                            for frag in v_value:
-                                                if isinstance(frag, dict):
-                                                    frag_type = frag.get("type", "")
-                                                    if frag_type == "THINK":
+                                            # 2. 处理 BATCH (递归处理里面的每一个子项)
+                                            if o == "BATCH" and isinstance(v, list):
+                                                for item in v:
+                                                    if isinstance(item, dict) and process_packet(item):
+                                                        return True
+                                                return False
+
+                                            # 3. 处理 Fragments 追加或切换
+                                            if (p == "response/fragments" or p == "fragments") and isinstance(v, list):
+                                                for f in v:
+                                                    if isinstance(f, dict):
+                                                        if f.get("o") == "APPEND": # 处理 BATCH 里的嵌套 APPEND
+                                                            for sub_f in f.get("v", []):
+                                                                process_frag(sub_f)
+                                                        else:
+                                                            process_frag(f)
+                                                return False
+                                            
+                                            # 4. 处理初始元数据 {"v": {"response": ...}}
+                                            if not p and isinstance(v, dict) and "response" in v:
+                                                initial_frags = v["response"].get("fragments", [])
+                                                for f in initial_frags:
+                                                    process_frag(f)
+                                                return False
+
+                                            # 5. 处理文本内容追加
+                                            if isinstance(v, str):
+                                                # 只有空路径(裸块)或者含 content 的路径才是有效文本
+                                                if not p or "content" in p:
+                                                    # 兼容旧协议路径切换
+                                                    if p == "response/thinking_content":
                                                         ptype = "thinking"
-                                                    elif frag_type == "RESPONSE":
+                                                    elif p == "response/content":
                                                         ptype = "text"
-                                                    else:
-                                                        # 跳过其他类型片段，如 "TIP" (免责声明)
-                                                        continue
-                                                    
-                                                    # --- 提取片段自带的初始内容 ---
-                                                    frag_content = frag.get("content", "")
-                                                    if frag_content:
-                                                        error_type = "thinking" if ptype == "thinking" else "text"
-                                                        fake_chunk = {
-                                                            "choices": [
-                                                                {
-                                                                    "index": 0,
-                                                                    "delta": {
-                                                                        "content": frag_content,
-                                                                        "type": error_type
-                                                                    }
-                                                                }
-                                                            ]
-                                                        }
-                                                        result_queue.put(fake_chunk)
                                             continue
 
 
@@ -1933,100 +1939,81 @@ async def chat_completions(request: Request):
                                 if "v" not in chunk:
                                     continue
 
-                                v_value = chunk["v"]
-                                p_value = chunk.get("p", "")
-                                o_value = chunk.get("o", "")
+                                # --- 定义核心解析逻辑以支持递归 BATCH 和 Fragment 提取 ---
+                                def process_frag(frag):
+                                    nonlocal ptype
+                                    if not isinstance(frag, dict): return
+                                    
+                                    f_type = frag.get("type", "")
+                                    if f_type == "THINK":
+                                        ptype = "thinking"
+                                    elif f_type == "RESPONSE":
+                                        ptype = "text"
+                                    
+                                    # 提取片段自带的初始内容
+                                    f_content = frag.get("content", "")
+                                    if f_content:
+                                        if ptype == "thinking":
+                                            think_list.append(f_content)
+                                        else:
+                                            text_list.append(f_content)
 
-                                # --- 1. 跳过搜索状态 ---
-                                if p_value == "response/search_status":
-                                    continue
+                                def process_packet(packet):
+                                    nonlocal ptype
+                                    p = packet.get("p", "")
+                                    o = packet.get("o", "")
+                                    v = packet.get("v")
 
-                                # --- 2. 检测 FINISHED 结束信号 ---
-                                # 形式A: {"p":"response/status","o":"SET","v":"FINISHED"}
-                                if (p_value == "response/status" or p_value == "status") and v_value == "FINISHED":
+                                    # 1. 检测结束信号 (FINISHED)
+                                    if (p == "response/status" or p == "status" or p == "quasi_status") and v == "FINISHED":
+                                        return True # 信号：需要终止采集
+
+                                    # 2. 处理 BATCH (递归处理里面的每一个子项)
+                                    if o == "BATCH" and isinstance(v, list):
+                                        for item in v:
+                                            if isinstance(item, dict) and process_packet(item):
+                                                return True
+                                        return False
+
+                                    # 3. 处理 Fragments 追加或切换
+                                    if (p == "response/fragments" or p == "fragments") and isinstance(v, list):
+                                        for f in v:
+                                            if isinstance(f, dict):
+                                                if f.get("o") == "APPEND": # 嵌套内容追加 (BATCH 内)
+                                                    for sub_f in f.get("v", []):
+                                                        process_frag(sub_f)
+                                                else:
+                                                    process_frag(f)
+                                        return False
+                                    
+                                    # 4. 处理初始元数据 {"v": {"response": ...}}
+                                    if not p and isinstance(v, dict) and "response" in v:
+                                        initial_frags = v["response"].get("fragments", [])
+                                        for f in initial_frags:
+                                            process_frag(f)
+                                        return False
+
+                                    # 5. 处理文本内容追加
+                                    if isinstance(v, str):
+                                        if not p or "content" in p:
+                                            if p == "response/thinking_content":
+                                                ptype = "thinking"
+                                            elif p == "response/content":
+                                                ptype = "text"
+                                            
+                                            if search_enabled and v.startswith("[citation:"):
+                                                return False
+                                            
+                                            if ptype == "thinking":
+                                                think_list.append(v)
+                                            else:
+                                                text_list.append(v)
+                                    return False
+
+                                # 执行解析
+                                if process_packet(chunk):
                                     break
 
-                                # 形式B: {"p":"response","o":"BATCH","v":[...,{"p":"quasi_status","v":"FINISHED"}]}
-                                if isinstance(v_value, list) and p_value == "response":
-                                    is_finished = False
-                                    for item in v_value:
-                                        if isinstance(item, dict) and item.get("p") == "quasi_status" and item.get("v") == "FINISHED":
-                                            is_finished = True
-                                            break
-                                    if is_finished:
-                                        break
-
-
-                                # --- 3. 检测 fragment 类型切换 ---
-                                if p_value == "response/fragments" and isinstance(v_value, list):
-                                    for frag in v_value:
-                                        if isinstance(frag, dict):
-                                            frag_type = frag.get("type", "")
-                                            if frag_type == "THINK":
-                                                ptype = "thinking"
-                                            elif frag_type == "RESPONSE":
-                                                ptype = "text"
-                                            else:
-                                                # 非流式模式同样过滤 TIP 片段
-                                                continue
-                                            
-                                            # --- 提取片段自带的初始内容 ---
-                                            frag_content = frag.get("content", "")
-                                            if frag_content:
-                                                if ptype == "thinking":
-                                                    think_list.append(frag_content)
-                                                else:
-                                                    text_list.append(frag_content)
-                                    continue
-
-
-                                # --- 4. 处理初始元数据 ---
-                                if isinstance(v_value, dict):
-                                    resp = v_value.get("response", {})
-                                    if resp:
-                                        fragments = resp.get("fragments", [])
-                                        for frag in fragments:
-                                            if isinstance(frag, dict):
-                                                frag_type = frag.get("type", "")
-                                                if frag_type == "THINK":
-                                                    ptype = "thinking"
-                                                elif frag_type == "RESPONSE":
-                                                    ptype = "text"
-                                                else:
-                                                    # 过滤初始元数据中的非内容片段
-                                                    continue
-                                                
-                                                # --- 提取初始内容 ---
-                                                initial_content = frag.get("content", "")
-                                                if initial_content:
-                                                    if ptype == "thinking":
-                                                        think_list.append(initial_content)
-                                                    else:
-                                                        text_list.append(initial_content)
-                                    continue
-
-
-                                # --- 5. 跳过非字符串内容 ---
-                                if not isinstance(v_value, str):
-                                    continue
-
-                                # --- 6. 过滤非内容路径 ---
-                                if p_value:
-                                    if "content" in p_value:
-                                        if p_value == "response/thinking_content":
-                                            ptype = "thinking"
-                                        elif p_value == "response/content":
-                                            ptype = "text"
-                                    else:
-                                        continue
-
-                                # --- 7. 处理文本内容 ---
-                                if search_enabled and v_value.startswith("[citation:"):
-                                    continue
-                                if ptype == "thinking":
-                                    think_list.append(v_value)
-                                else:
-                                    text_list.append(v_value)
             
                             except Exception as e:
                                 logger.warning(f"[collect_data] 无法解析: {data_str}, 错误: {e}")
