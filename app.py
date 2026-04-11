@@ -227,15 +227,27 @@ def login_deepseek_via_account(account):
 # ----------------------------------------------------------------------
 # (4) 从 accounts 中随机选择一个未忙且未尝试过的账号
 # ----------------------------------------------------------------------
-def choose_new_account(exclude_ids=None):
+def choose_new_account(exclude_ids=None, preferred_email=None):
     """选择策略：
-    1. 遍历队列，找到第一个未被 exclude_ids 包含的账号
-    2. 从队列中移除该账号
-    3. 返回该账号（由后续逻辑保证最终会重新入队）
+    1. 如果指定了 preferred_email，优先寻找该账号
+    2. 否则按原顺序遍历队列，找到第一个未被 exclude_ids 包含的账号
+    3. 从队列中移除该账号并返回
     """
     if exclude_ids is None:
         exclude_ids = []
-        
+    
+    # --- 策略 A: 优先尝试锁定指定账号 ---
+    if preferred_email:
+        for i in range(len(account_queue)):
+            acc = account_queue[i]
+            if acc.get("email") == preferred_email:
+                acc_id = get_account_identifier(acc)
+                if acc_id not in exclude_ids:
+                    logger.info(f"[choose_new_account] 锁定首选账号: {acc_id}")
+                    return account_queue.pop(i)
+        logger.info(f"[choose_new_account] 未找到可用的首选账号 {preferred_email}，回退到随机模式")
+
+    # --- 策略 B: 常规轮询 ---
     for i in range(len(account_queue)):
         acc = account_queue[i]
         acc_id = get_account_identifier(acc)
@@ -269,7 +281,7 @@ def release_claude_api_key(api_key):
 # ----------------------------------------------------------------------
 # (5) 判断调用模式：配置模式 vs 用户自带 token
 # ----------------------------------------------------------------------
-def determine_mode_and_token(request: Request):
+def determine_mode_and_token(request: Request, forced_account_email=None):
     """
     根据请求头 Authorization 判断使用哪种模式：
     - 如果 Bearer token 出现在 CONFIG["keys"] 中，则为配置模式，从 CONFIG["accounts"] 中随机选择一个账号（排除已尝试账号），
@@ -287,7 +299,7 @@ def determine_mode_and_token(request: Request):
     if caller_key in config_keys:
         request.state.use_config_token = True
         request.state.tried_accounts = []  # 初始化已尝试账号
-        selected_account = choose_new_account()
+        selected_account = choose_new_account(preferred_email=forced_account_email)
         if not selected_account:
             raise HTTPException(
                 status_code=429,
@@ -536,7 +548,7 @@ def upload_to_deepseek(token: str, content: str, filename: str = "user_input.txt
         
         file_id = data["data"]["biz_data"]["id"]
         initial_status = data["data"]["biz_data"].get("status", "")
-        token_usage = data["data"]["biz_data"].get("token_usage", 0)
+        token_usage = data["data"]["biz_data"].get("token_usage") or 0
         logger.info(f"[upload_to_deepseek] 上传响应: file_id={file_id}, status={initial_status}, tokens={token_usage:,}")
         
         # 6. 轮询 fetch_files 等待文件处理完成
@@ -1310,9 +1322,33 @@ def process_messages_for_tools(messages: list) -> list:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
-        # 处理 token 相关逻辑，若登录失败则直接返回错误响应
+        # 1. 预解析请求体
         try:
-            determine_mode_and_token(request)
+            req_data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body.")
+            
+        model = req_data.get("model")
+        messages = req_data.get("messages", [])
+        tools = req_data.get("tools", [])
+        
+        if not model or not messages:
+            raise HTTPException(
+                status_code=400, detail="Request must include 'model' and 'messages'."
+            )
+            
+        # 2. 提前解析控制标签（判定是否需要强制锁定账号）
+        # 注意：parse_upload_tags 会修改 messages 原位清除标签
+        upload_tags = parse_upload_tags(messages)
+        
+        forced_email = None
+        if upload_tags.get("reupload") and CONFIG.get("file_reuse_account"):
+            forced_email = CONFIG["file_reuse_account"]
+            logger.info(f"[chat_completions] 检测到文件复用标签，尝试锁定专用账号: {forced_email}")
+
+        # 3. 处理 token 相关逻辑，此时已知是否需要特定账号
+        try:
+            determine_mode_and_token(request, forced_account_email=forced_email)
         except HTTPException as exc:
             return JSONResponse(
                 status_code=exc.status_code, content={"error": exc.detail}
@@ -1323,27 +1359,14 @@ async def chat_completions(request: Request):
                 status_code=500, content={"error": "Account login failed."}
             )
 
-        req_data = await request.json()
-        model = req_data.get("model")
-        messages = req_data.get("messages", [])
-        tools = req_data.get("tools", [])
-        if not model or not messages:
-            raise HTTPException(
-                status_code=400, detail="Request must include 'model' and 'messages'."
-            )
-            
-        # ====== Tool Calling 预处理 ======
+        # 4. 参数解析与工具预处理
+        thinking_enabled, search_enabled, model_type = resolve_model_params(model)
+        
         if tools:
             tool_prompt = format_tools_to_system_prompt(tools)
             messages.insert(0, {"role": "system", "content": tool_prompt})
         messages = process_messages_for_tools(messages)
-        # =================================
-        # 判断是否启用"思考"或"搜索"功能以及模型类型（这里根据模型名称解析）
-        thinking_enabled, search_enabled, model_type = resolve_model_params(model)
 
-        # ====== 解析标签 & 文件上传决策 ======
-        # 1. 先解析标签（会修改 messages，清除标签内容）
-        upload_tags = parse_upload_tags(messages)
         logger.info(f"[upload_tags] 解析结果: force={upload_tags['force_upload']}, "
                      f"fileid={upload_tags['return_fileid']}, reupload={upload_tags['reupload']}, "
                      f"upload_all={upload_tags['upload_all']}, "
@@ -1457,6 +1480,7 @@ async def chat_completions(request: Request):
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
             "model_type": model_type,
+            "preempt": False,
         }
 
 

@@ -6,6 +6,7 @@
   "auto_upload_token_threshold": 400000,
   "auto_upload_char_threshold_max": 700000,
   "auto_upload_char_threshold_min": 400000,
+  "file_reuse_account": "timigogohehe@gmail.com",
   "accounts": [
     {
       "email": "timigogohehe@gmail.com",
@@ -25,7 +26,7 @@
     {
       "email": "weiweifunny525@gmail.com",
       "password": "wei123..",
-      "token": "8NhfaC3fFAFD3ix8hgAQJSkfxl+aWWRUTIGFSczjvtowDjdg5aAeKhoMbs6xgeeS"
+      "token": "s2o9+3nDmIoYk95nyTjtzDIHCv0u/fDLicfw3d3q6Y01lED5mS28nyrG6E+6QBxR"
     }
   ]
 }
