@@ -1524,6 +1524,10 @@ async def chat_completions(request: Request):
                                             if not isinstance(frag, dict): return
                                             
                                             f_type = frag.get("type", "")
+                                            # 只处理思维链和回复正文，过滤 TIP 等免责声明
+                                            if f_type not in ["THINK", "RESPONSE"]:
+                                                return
+
                                             if f_type == "THINK":
                                                 ptype = "thinking"
                                             elif f_type == "RESPONSE":
@@ -1883,6 +1887,10 @@ async def chat_completions(request: Request):
                                     if not isinstance(frag, dict): return
                                     
                                     f_type = frag.get("type", "")
+                                    # 只处理思维链和回复正文，过滤 TIP 等免责声明
+                                    if f_type not in ["THINK", "RESPONSE"]:
+                                        return
+
                                     if f_type == "THINK":
                                         ptype = "thinking"
                                     elif f_type == "RESPONSE":
