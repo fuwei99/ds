@@ -785,6 +785,11 @@ def resolve_model_params(model_name: str):
     return thinking_enabled, search_enabled, model_type
 
 
+def is_continue_prefill(messages: list) -> bool:
+    """判断是否为 prefill 续写模式：最后一条消息是 assistant"""
+    return bool(messages) and messages[-1].get("role") == "assistant"
+
+
 # ----------------------------------------------------------------------
 # Claude API 调用函数
 # ----------------------------------------------------------------------
@@ -813,6 +818,9 @@ async def call_claude_via_openai(request: Request, claude_payload):
         
         # 解析模型参数
         thinking_enabled, search_enabled, model_type = resolve_model_params(model)
+        if is_continue_prefill(messages):
+            thinking_enabled = False
+            logger.info(f"[prefill] 检测到 assistant 预填充，强制关闭 thinking 模式 (model={model})")
         
         # 使用 messages_prepare 函数构造最终 prompt
         final_prompt = messages_prepare(messages)
@@ -1257,8 +1265,13 @@ def messages_prepare(messages: list) -> str:
             parts.append(f"Human:\n{text}")
         elif role == "assistant":
             if is_last:
-                # Prefill: 最后一条 assistant 消息不加 EOS，加续写指令防止模型从头重写
-                parts.append(f"Assistant:\n{text}\n[继续，不要重复已有内容]")
+                # Prefill: 在最后一条 assistant 前插入续写约束，并以 <|continue|> 作为续写锚点
+                parts.append(
+                    "System:\n"
+                    "你必须续写已经写出的前缀。\n"
+                    "必须从前缀末尾<|continue|>继续补全，严禁重复前缀内容，不得重新开场"
+                )
+                parts.append(f"Assistant:\n{text}<|continue|>")
             else:
                 parts.append(f"Assistant:\n{text}<｜end▁of▁sentence｜>")
         else:
@@ -1410,6 +1423,9 @@ async def chat_completions(request: Request):
             tool_prompt = format_tools_to_system_prompt(tools)
             messages.insert(0, {"role": "system", "content": tool_prompt})
         messages = process_messages_for_tools(messages)
+        if is_continue_prefill(messages):
+            thinking_enabled = False
+            logger.info(f"[prefill] 检测到 assistant 预填充，强制关闭 thinking 模式 (model={model})")
 
         logger.info(f"[upload_tags] 解析结果: force={upload_tags['force_upload']}, "
                      f"fileid={upload_tags['return_fileid']}, reupload={upload_tags['reupload']}, "
