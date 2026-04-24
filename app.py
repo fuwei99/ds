@@ -1169,14 +1169,12 @@ def list_models():
     models_list = [
         # Chat Models
         {"id": "deepseek-chat", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
-        {"id": "deepseek-v3", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-chat-expert", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-chat-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-chat-expert-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         
         # Reasoner Models
         {"id": "deepseek-reasoner", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
-        {"id": "deepseek-r1", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-reasoner-expert", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-reasoner-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-reasoner-expert-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
@@ -1251,20 +1249,25 @@ def messages_prepare(messages: list) -> str:
     for idx, block in enumerate(merged):
         role = block["role"]
         text = block["text"]
+        is_last = (idx == len(merged) - 1)
         
         if role == "system":
             parts.append(f"System:\n{text}")
         elif role == "user":
             parts.append(f"Human:\n{text}")
         elif role == "assistant":
-            parts.append(f"Assistant:\n{text}<｜end▁of▁sentence｜>")
+            if is_last:
+                # Prefill: 最后一条 assistant 消息不加 EOS，加续写指令防止模型从头重写
+                parts.append(f"Assistant:\n{text}\n[继续，不要重复已有内容]")
+            else:
+                parts.append(f"Assistant:\n{text}<｜end▁of▁sentence｜>")
         else:
             parts.append(text)
             
     final_prompt = "\n\n".join(parts)
     
-    # 强制以 Assistant: 结尾，引导模型开始回答
-    if not final_prompt.endswith("Assistant:\n"):
+    # 如果最后一条消息不是 assistant，则追加 Assistant: 引导模型开始回答
+    if merged[-1]["role"] != "assistant":
         final_prompt += "\n\nAssistant:\n"
     # 仅移除 markdown 图片格式(不全部移除 !）
     final_prompt = re.sub(r"!\[(.*?)\]\((.*?)\)", r"[\1](\2)", final_prompt)
