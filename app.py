@@ -312,6 +312,8 @@ def determine_mode_and_token(request: Request, forced_account_email=None):
                 logger.error(
                     f"[determine_mode_and_token] 账号 {get_account_identifier(selected_account)} 登录失败：{e}"
                 )
+                # 登录失败时将账号放回队列，而不是直接丢弃
+                release_account(selected_account)
                 raise HTTPException(status_code=500, detail="Account login failed.")
 
         request.state.deepseek_token = selected_account.get("token")
@@ -909,26 +911,20 @@ def create_session(request: Request, max_attempts=3):
                 current_acc = request.state.account
                 current_id = get_account_identifier(current_acc)
                 
-                # 1. 清除失效的 Token
+                # 1. Token 失效，先尝试原地重新登录（所有账号都尝试，不只是专用账号）
                 if current_acc:
                     current_acc["token"] = ""
-                    logger.info(f"[create_session] 账号 {current_id} Token 已失效，已将其清空")
-
-                # 2. 如果是“被点名”的固定账号，尝试原地救活，而不是直接换人
-                # 检查是否是 file_reuse_account 或者是当前请求强制指定的账号
-                forced_email = CONFIG.get("file_reuse_account")
-                if current_acc and current_acc.get("email") == forced_email:
-                    logger.info(f"[create_session] 专用账号 {current_id} 失效，尝试原地刷新 Token...")
+                    logger.info(f"[create_session] 账号 {current_id} Token 已失效，尝试原地重新登录...")
                     try:
                         new_token = login_deepseek_via_account(current_acc)
                         request.state.deepseek_token = new_token
-                        attempts += 1 # 增加尝试次数但保持使用当前账号
-                        logger.info(f"[create_session] 专用账号 {current_id} 原地刷新成功，准备重试")
+                        attempts += 1
+                        logger.info(f"[create_session] 账号 {current_id} 原地重新登录成功，准备重试")
                         continue
                     except Exception as e:
-                        logger.error(f"[create_session] 专用账号原地刷新失败: {e}，将尝试切换其他账号")
+                        logger.error(f"[create_session] 账号 {current_id} 原地重新登录失败: {e}，将尝试切换其他账号")
 
-                # 3. 如果不是固定账号或原地刷新失败，再走常规换号逻辑
+                # 2. 原地重新登录失败，走常规换号逻辑
                 if not hasattr(request.state, "tried_accounts"):
                     request.state.tried_accounts = []
                 if current_id not in request.state.tried_accounts:
@@ -1125,25 +1121,20 @@ def get_pow_response(request: Request, max_attempts=3):
                 current_acc = request.state.account
                 current_id = get_account_identifier(current_acc)
                 
-                # 1. 清除失效的 Token
+                # 1. Token 失效，先尝试原地重新登录（所有账号都尝试，不只是专用账号）
                 if current_acc:
                     current_acc["token"] = ""
-                    logger.info(f"[get_pow_response] 账号 {current_id} Token 已失效，已将其清空")
-
-                # 2. 如果是“被点名”的固定账号，尝试原地救活
-                forced_email = CONFIG.get("file_reuse_account")
-                if current_acc and current_acc.get("email") == forced_email:
-                    logger.info(f"[get_pow_response] 专用账号 {current_id} 失效，尝试原地刷新 Token...")
+                    logger.info(f"[get_pow_response] 账号 {current_id} Token 已失效，尝试原地重新登录...")
                     try:
                         new_token = login_deepseek_via_account(current_acc)
                         request.state.deepseek_token = new_token
                         attempts += 1
-                        logger.info(f"[get_pow_response] 专用账号 {current_id} 原地刷新成功，准备重试")
+                        logger.info(f"[get_pow_response] 账号 {current_id} 原地重新登录成功，准备重试")
                         continue
                     except Exception as e:
-                        logger.error(f"[get_pow_response] 专用账号原地刷新失败: {e}，将尝试切换其他账号")
+                        logger.error(f"[get_pow_response] 账号 {current_id} 原地重新登录失败: {e}，将尝试切换其他账号")
 
-                # 3. 常规换号逻辑
+                # 2. 原地重新登录失败，走常规换号逻辑
                 if not hasattr(request.state, "tried_accounts"):
                     request.state.tried_accounts = []
                 if current_id not in request.state.tried_accounts:
