@@ -1270,7 +1270,7 @@ def messages_prepare(messages: list, is_tool_call: bool = False) -> str:
         elif role == "user":
             user_content = f"Human:\n{text}"
             if is_tool_call and idx == last_user_idx:
-                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<|DSML|tool_calls>\n  <|DSML|invoke name=\"tool_name\">\n    <|DSML|parameter name=\"arg\" string=\"true\">val</|DSML|parameter>\n  </|DSML|invoke>\n</|DSML|tool_calls>"
+                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<|DSML|tool_calls>\n<|DSML|invoke name=\"tool_name\">\n<|DSML|parameter name=\"arg_name\" string=\"true\">value</|DSML|parameter>\n</|DSML|invoke>\n</|DSML|tool_calls>"
             parts.append(user_content)
         elif role == "assistant":
             if is_last:
@@ -1307,51 +1307,34 @@ def format_tools_to_system_prompt(tools: list) -> str:
     if not tools:
         return ""
     
-    prompt = "### [CRITICAL] TOOL CALLING INSTRUCTIONS\n\n"
-    prompt += "If you want to call a tool, you MUST output a block wrapped in <|DSML|tool_calls> and </|DSML|tool_calls> tags.\n\n"
-    prompt += "DO NOT output any other XML tags except below or markdown tag (eg:```xml) for tool calls.\n\n"
-    prompt += "IMPORTANT: For string parameters, set string=\"true\". For other types (numbers, booleans, arrays, objects), pass the value in JSON format and set string=\"false\".\n\n"
-    prompt += "Format:\n<|DSML|tool_calls>\n"
-    prompt += "  <|DSML|invoke name=\"tool_name\">\n"
-    prompt += "    <|DSML|parameter name=\"arg1\" string=\"true\">raw_string_value</|DSML|parameter>\n"
-    prompt += "    <|DSML|parameter name=\"arg2\" string=\"false\">[json, value]</|DSML|parameter>\n"
-    prompt += "  </|DSML|invoke>\n"
+    prompt = "## Tools\n\n"
+    prompt += "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<|DSML|tool_calls>\" block like the following:\n\n"
+    prompt += "<|DSML|tool_calls>\n"
+    prompt += "<|DSML|invoke name=\"$TOOL_NAME\">\n"
+    prompt += "<|DSML|parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</|DSML|parameter>\n"
+    prompt += "...\n"
+    prompt += "</|DSML|invoke>\n"
     prompt += "</|DSML|tool_calls>\n\n"
     
-    prompt += "Example:\n<|DSML|tool_calls>\n"
-    prompt += "  <|DSML|invoke name=\"read\">\n"
-    prompt += "    <|DSML|parameter name=\"filePath\" string=\"true\">C:\\Users\\zhishang\\Desktop\\README.md</|DSML|parameter>\n"
-    prompt += "  </|DSML|invoke>\n"
-    prompt += "</|DSML|tool_calls>\n"
+    prompt += "String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n"
+    
+    prompt += "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\n"
+    
+    prompt += "Example:\n"
     prompt += "<|DSML|tool_calls>\n"
-    prompt += "  <|DSML|invoke name=\"write\">\n"
-    prompt += "    <|DSML|parameter name=\"filePath\" string=\"true\">C:\\Users\\zhishang\\Desktop\\hello.py</|DSML|parameter>\n"
-    prompt += "    <|DSML|parameter name=\"content\" string=\"true\">\n"
+    prompt += "<|DSML|invoke name=\"read\">\n"
+    prompt += "<|DSML|parameter name=\"filePath\" string=\"true\">C:\\Users\\zhishang\\Desktop\\README.md</|DSML|parameter>\n"
+    prompt += "</|DSML|invoke>\n"
+    prompt += "<|DSML|invoke name=\"write\">\n"
+    prompt += "<|DSML|parameter name=\"filePath\" string=\"true\">C:\\Users\\zhishang\\Desktop\\hello.py</|DSML|parameter>\n"
+    prompt += "<|DSML|parameter name=\"content\" string=\"true\">\n"
     prompt += "def main():\n"
     prompt += "    print(\"Hello World\")\n"
-    prompt += "\n"
-    prompt += "if __name__ == \"__main__\":\n"
-    prompt += "    main()\n"
-    prompt += "    </|DSML|parameter>\n"
-    prompt += "  </|DSML|invoke>\n"
-    prompt += "</|DSML|tool_calls>\n"
-    prompt += "<|DSML|tool_calls>\n"
-    prompt += "  <|DSML|invoke name=\"question\">\n"
-    prompt += "    <|DSML|parameter name=\"questions\" string=\"false\">\n"
-    prompt += "      [\n"
-    prompt += "        {\n"
-    prompt += "          \"question\": \"你希望按什么方向重写？\",\n"
-    prompt += "          \"header\": \"重写方向\",\n"
-    prompt += "          \"options\": [\n"
-    prompt += "            {\"label\": \"保持原有结构\", \"description\": \"...\"}\n"
-    prompt += "          ]\n"
-    prompt += "        }\n"
-    prompt += "      ]\n"
-    prompt += "    </|DSML|parameter>\n"
-    prompt += "  </|DSML|invoke>\n"
+    prompt += "</|DSML|parameter>\n"
+    prompt += "</|DSML|invoke>\n"
     prompt += "</|DSML|tool_calls>\n\n"
 
-    prompt += "### AVAILABLE TOOLS\n\n"
+    prompt += "### Available Tool Schemas\n\n"
     
     for t in tools:
         if t.get("type") == "function":
@@ -1361,85 +1344,44 @@ def format_tools_to_system_prompt(tools: list) -> str:
             prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
     
     prompt += "[REPRISES]\n"
-    prompt += "Remember: MUST wrap tool calls in <|DSML|tool_calls> tags. DO NOT use markdown code blocks. NO escape needed for content inside XML tags. All XML tags MUST be closed. DO NOT omit any closing tags.\n"
+    prompt += "Remember: You MUST strictly follow the above defined DSML tool calling schema. All tags MUST be closed. DO NOT use markdown blocks for tool calls.\n"
     
     return prompt
 
-def parse_tool_call_any(text: str) -> list:
+def parse_dsml_tool_calls(text: str) -> list:
     """
-    解析工具调用，支持 DeepSeek-V4 官方格式及旧版 XML/JSON 格式。
-    始终返回列表: [{"name": "xxx", "arguments": {...}}, ...]
+    解析 DeepSeek-V4 DSML 格式的多个工具调用。
+    返回: [{"name": str, "args": dict}, ...]
     """
     results = []
     
-    # 1. 优先尝试官方 DSML 格式 (支持多 invoke 并行)
-    # 先看有没有整个大容器，没有就直接搜 invoke
-    blocks = re.findall(r'<\|DSML\|tool_calls>(.*?)</\|DSML\|tool_calls>', text, re.DOTALL)
-    search_space = blocks if blocks else [text]
+    # 查找所有的 invoke 块
+    invoke_pattern = re.compile(r'<\|DSML\|invoke name=["\']([^"\']+)["\']>(.*?)</\|DSML\|invoke>', re.DOTALL)
+    # 增强版参数匹配，解决漏写闭合标签
+    param_pattern = re.compile(r'<\|DSML\|parameter name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=</\|DSML\|invoke>)|(?=</\|DSML\|tool_calls>)|$)', re.DOTALL)
     
-    for content in search_space:
-        invoke_pattern = re.compile(r'<\|DSML\|invoke\s+name=["\']([^"\']+)["\']>(.*?)(?:</\|DSML\|invoke>|(?=<\|DSML\|invoke)|$)', re.DOTALL)
-        for im in invoke_pattern.finditer(content):
-            name = im.group(1).strip()
-            invoke_inner = im.group(2)
-            args = {}
-            # 提取参数
-            param_pattern = re.compile(
-                r'<\|DSML\|parameter\s+name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=<\|DSML\|parameter)|$)', 
-                re.DOTALL
-            )
-            for pm in param_pattern.finditer(invoke_inner):
-                p_name, p_is_string, p_val = pm.group(1), pm.group(2).lower() == "true", pm.group(3)
-                if p_is_string:
-                    args[p_name] = p_val.strip()
-                else:
-                    stripped = p_val.strip()
-                    try:
-                        args[p_name] = json.loads(stripped)
-                    except:
-                        args[p_name] = stripped
-            if name:
-                results.append({"name": name, "arguments": args})
-            
-    if results:
-        return results
-
-    # 2. 回退：尝试旧版 XML 解析 (单请求模式)
-    name = None
-    name_match = re.search(r'<(?:tool|tool_call)\s+name=["\']([^"\']+)["\']', text)
-    if not name_match:
-        name_match = re.search(r'<name>(.*?)</name>', text, re.DOTALL)
-    
-    if name_match:
-        name = name_match.group(1).strip()
-        args = {}
-        args_section = re.search(r'<arguments>(.*?)</arguments>', text, re.DOTALL)
-        content_to_search = args_section.group(1) if args_section else text
-        tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)(?:</\1>|(?=</arguments>)|(?=</tool_call>)|(?=</tool>)|$)', re.DOTALL)
-        for tm in tag_pattern.finditer(content_to_search):
-            tag, val = tm.group(1), tm.group(2)
-            if tag not in ["name", "arguments", "tool_call", "tool"]:
-                val_stripped = val.strip()
-                if (val_stripped.startswith('{') and val_stripped.endswith('}')) or (val_stripped.startswith('[') and val_stripped.endswith(']')):
-                    try:
-                        args[tag] = json.loads(val_stripped)
-                    except: args[tag] = val_stripped
-                else:
-                    args[tag] = val.strip()
-        return [{"name": name, "arguments": args}]
-
-    # 3. 如果 XML 没找到 name，尝试传统的纯 JSON 解析
-    try:
-        clean_json = text.strip()
-        if clean_json.startswith("```json"): clean_json = clean_json[7:]
-        if clean_json.endswith("```"): clean_json = clean_json[:-3]
-        parsed = json.loads(clean_json.strip())
-        if isinstance(parsed, dict) and parsed.get("name"):
-            return [{"name": parsed.get("name"), "arguments": parsed.get("arguments", {})}]
-    except:
-        pass
+    for inv_match in invoke_pattern.finditer(text):
+        tool_name = inv_match.group(1).strip()
+        inv_content = inv_match.group(2)
         
-    return []
+        args = {}
+        for pm in param_pattern.finditer(inv_content):
+            p_name = pm.group(1).strip()
+            is_string = pm.group(2).lower() == "true"
+            p_val = pm.group(3).strip()
+            
+            if is_string:
+                args[p_name] = p_val
+            else:
+                try:
+                    args[p_name] = json.loads(p_val)
+                except:
+                    args[p_name] = p_val
+        
+        if tool_name:
+            results.append({"name": tool_name, "args": args})
+            
+    return results
 
 def _content_to_str(content) -> str:
     """将 content 统一转换为字符串（兼容 OpenAI 多模态 list 格式）"""
@@ -1485,15 +1427,15 @@ def process_messages_for_tools(messages: list) -> list:
                     except:
                         pass
                 
-                # 转换回 DeepSeek-V4 官方格式以提供上下文
-                xml_call = "\n<|DSML|tool_calls>\n  <|DSML|invoke name=\"{}\">\n".format(func.get("name"))
+                # 转换回 DSML 格式以提供上下文
+                dsml_call = "\n<|DSML|tool_calls>\n<|DSML|invoke name=\"{}\">\n".format(func.get("name"))
                 if isinstance(args, dict):
                     for k, v in args.items():
-                        is_string = "true" if not (isinstance(v, (dict, list))) else "false"
-                        val_str = v if is_string == "true" else json.dumps(v, ensure_ascii=False)
-                        xml_call += "    <|DSML|parameter name=\"{0}\" string=\"{1}\">{2}</|DSML|parameter>\n".format(k, is_string, val_str)
-                xml_call += "  </|DSML|invoke>\n</|DSML|tool_calls>\n"
-                content += xml_call
+                        is_str = "true" if isinstance(v, str) else "false"
+                        v_str = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                        dsml_call += "  <|DSML|parameter name=\"{0}\" string=\"{1}\">{2}</|DSML|parameter>\n".format(k, is_str, v_str)
+                dsml_call += "</|DSML|invoke>\n</|DSML|tool_calls>\n"
+                content += dsml_call
             msg["content"] = content.strip()
             
         # 如果是 tool 结果回复
@@ -1961,14 +1903,10 @@ async def chat_completions(request: Request):
                                     
                                     while len(text_buffer) > 0:
                                         if not in_tool_call:
-                                            # 支持识别官方 DSML 标签
                                             pos = text_buffer.find("<|DSML|tool_calls>")
-                                            if pos == -1: pos = text_buffer.find("<tool_call>")
-                                            
                                             if pos != -1:
-                                                tag_len = len("<|DSML|tool_calls>") if text_buffer[pos:pos+2] == "<|" else len("<tool_call>")
                                                 before_text = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到工具开始标签 at pos={pos}, 前置文本='{before_text[:30]}'")
+                                                logger.debug(f"[tool_detect] ✅ 检测到 <|DSML|tool_calls> at pos={pos}, 前置文本='{before_text[:30]}'")
                                                 if before_text:
                                                     final_text += before_text
                                                     delta_obj = {"content": before_text}
@@ -1977,14 +1915,15 @@ async def chat_completions(request: Request):
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 in_tool_call = True
-                                                text_buffer = text_buffer[pos + tag_len:]
+                                                text_buffer = text_buffer[pos + len("<|DSML|tool_calls>"):]
                                             else:
-                                                # 检查截断情况，防止标签被切断
+                                                # Check if ending might be <|DSML|tool_calls> prefix
                                                 safe_len = len(text_buffer)
-                                                for tag in ["<|DSML|tool_calls>", "<tool_call>"]:
-                                                    for i in range(1, len(tag)):
-                                                        if text_buffer.endswith(tag[:i]):
-                                                            safe_len = min(safe_len, len(text_buffer) - i)
+                                                tag_start = "<|DSML|tool_calls>"
+                                                for i in range(1, len(tag_start)):
+                                                    if text_buffer.endswith(tag_start[:i]):
+                                                        safe_len -= i
+                                                        break
                                                 safe_text = text_buffer[:safe_len]
                                                 text_buffer = text_buffer[safe_len:]
                                                 if safe_text:
@@ -1997,32 +1936,23 @@ async def chat_completions(request: Request):
                                                 break # Wait for more data
                                         else:
                                             pos = text_buffer.find("</|DSML|tool_calls>")
-                                            tag_len = len("</|DSML|tool_calls>")
-                                            if pos == -1:
-                                                pos = text_buffer.find("</tool_call>")
-                                                tag_len = len("</tool_call>")
-                                            
                                             if pos != -1:
-                                                tool_block_content = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到工具结束标签, 内容长度={len(tool_block_content)}")
-                                                text_buffer = text_buffer[pos + tag_len:]
+                                                tool_content = text_buffer[:pos]
+                                                logger.debug(f"[tool_detect] ✅ 检测到 </|DSML|tool_calls>, 内容长度='{len(tool_content)}'")
+                                                text_buffer = text_buffer[pos + len("</|DSML|tool_calls>"):]
                                                 in_tool_call = False
                                                 
                                                 try:
-                                                    # 解析可能存在的多个并行的工具调用
-                                                    tool_calls_list = parse_tool_call_any(tool_block_content.strip())
-                                                    if not tool_calls_list:
-                                                        # 虽然没解析出来，但可能是为了兼容性原始输出
-                                                        delta_obj = {"content": f"<tool_call>{tool_block_content}</tool_call>"}
-                                                        new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
-                                                        continue
-
-                                                    for t_call in tool_calls_list:
-                                                        t_name = t_call.get("name")
-                                                        t_args_dict = t_call.get("arguments", {})
+                                                    calls = parse_dsml_tool_calls(tool_content.strip())
+                                                    if not calls:
+                                                        raise ValueError("Invalid DSML tool call format")
+                                                    
+                                                    for call in calls:
+                                                        t_name = call["name"]
+                                                        t_args_dict = call["args"]
                                                         
                                                         # 将 args_dict 转回 JSON 字符串供客户端使用 (OpenAI 标准)
-                                                        t_args_str = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
+                                                        t_args = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
                                                         
                                                         delta_obj = {
                                                             "tool_calls": [{
@@ -2031,7 +1961,7 @@ async def chat_completions(request: Request):
                                                                 "type": "function",
                                                                 "function": {
                                                                     "name": t_name,
-                                                                    "arguments": t_args_str
+                                                                    "arguments": t_args
                                                                 }
                                                             }]
                                                         }
@@ -2042,8 +1972,13 @@ async def chat_completions(request: Request):
                                                         has_tool_calls_streamed = True
                                                         tool_call_index += 1
                                                 except Exception as e:
-                                                    logger.warning(f"Failed to parse tool call block: {e}")
-                                                    delta_obj = {"content": f"\n[PARSE_ERROR: {tool_block_content}]\n"}
+                                                    logger.warning(f"Failed to parse DSML call: {e}")
+                                                    fallback_text = f"\n<|DSML|tool_calls>{tool_content}</|DSML|tool_calls>\n"
+                                                    delta_obj = {"content": fallback_text}
+                                                    final_text += fallback_text
+                                                    if not first_chunk_sent:
+                                                        delta_obj["role"] = "assistant"
+                                                        first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                             else:
                                                 break # Wait for ending tag
@@ -2217,25 +2152,36 @@ async def chat_completions(request: Request):
                         # --- 检测并解析 tool_calls ---
                         tool_calls = []
                         
-                        # 尝试提取 DeepSeek-V4 DSML 或 旧版 XML 格式的工具调用
-                        parsed_calls = parse_tool_call_any(final_content)
-                        for p_call in parsed_calls:
-                            t_name = p_call.get("name")
-                            t_args_dict = p_call.get("arguments", {})
-                            t_args_str = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
+                        while "<tool_call>" in final_content and "</tool_call>" in final_content:
+                            start_idx = final_content.find("<tool_call>")
+                            end_idx = final_content.find("</tool_call>", start_idx)
+                            if end_idx == -1:
+                                break
                             
-                            tool_calls.append({
-                                "id": f"call_{len(tool_calls)}_{int(time.time())}",
-                                "type": "function",
-                                "function": {
-                                    "name": t_name,
-                                    "arguments": t_args_str
-                                }
-                            })
+                            json_str = final_content[start_idx + len("<tool_call>"):end_idx].strip()
+                            
+                            try:
+                                parsed = json.loads(json_str)
+                                args = parsed.get("arguments", "{}")
+                                if isinstance(args, dict):
+                                    args = json.dumps(args, ensure_ascii=False)
+                                elif not isinstance(args, str):
+                                    args = str(args)
+                                    
+                                tool_calls.append({
+                                    "id": f"call_{len(tool_calls)}_{int(time.time())}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": parsed.get("name", ""),
+                                        "arguments": args
+                                    }
+                                })
+                            except Exception as e:
+                                logger.warning(f"解析 tool_call 失败: {json_str}, error: {e}")
+                                
+                            # 移除这部分 tool_call
+                            final_content = final_content[:start_idx] + final_content[end_idx + len("</tool_call>"):]
                         
-                        # 清理内容中的工具调用块
-                        final_content = re.sub(r'<\|DSML\|tool_calls>.*?</\|DSML\|tool_calls>', '', final_content, flags=re.DOTALL)
-                        final_content = re.sub(r'<tool_call>.*?</tool_call>', '', final_content, flags=re.DOTALL)
                         final_content = final_content.strip()
 
                         # 追加文件信息
