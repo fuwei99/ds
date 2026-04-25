@@ -1309,6 +1309,7 @@ def format_tools_to_system_prompt(tools: list) -> str:
     
     prompt = "### [CRITICAL] TOOL CALLING INSTRUCTIONS\n\n"
     prompt += "If you want to call a tool, you MUST output an XML block wrapped in <tool_call> and </tool_call> tags.\n\n"
+    prompt += "CRITICAL FORMAT RULE: You MUST use <name>tool_name</name> to specify the tool name. DO NOT use <tool name=\"...\"> or any other unexpected xml tag.\n\n"
     prompt += "DO NOT output any other XML tags except below or markdown tag (eg:```xml) for tool calls.\n\n"
     prompt += "IMPORTANT: For simple string parameters, place the raw text directly inside the tag (NO escape needed). However, if a parameter expects an Array or Object, you MUST output valid JSON format inside the tag.\n\n"
     prompt += "Format:\n<tool_call>\n"
@@ -1375,9 +1376,17 @@ def parse_tool_call_any(text: str):
     返回 (name, arguments_dict)
     """
     # 1. 尝试 XML 解析
+    name = None
     name_match = re.search(r'<name>(.*?)</name>', text, re.DOTALL)
     if name_match:
         name = name_match.group(1).strip()
+    else:
+        # Fallback 容错: <tool name="ask_user"> 或者 <tool_call name="ask_user">
+        fallback_match = re.search(r'<(?:tool|tool_call)[^>]+name=["\'](.*?)["\']', text, re.IGNORECASE)
+        if fallback_match:
+            name = fallback_match.group(1).strip()
+
+    if name:
         args = {}
         # 寻找 <arguments> 块
         args_section = re.search(r'<arguments>(.*?)</arguments>', text, re.DOTALL)
@@ -1385,10 +1394,23 @@ def parse_tool_call_any(text: str):
         
         # 匹配所有 <tag>value</tag> 形式，排除一些保留字
         tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)</\1>', re.DOTALL)
-        for tm in tag_pattern.finditer(content_to_search):
+        matches = list(tag_pattern.finditer(content_to_search))
+        
+        # Fallback 容错: 考虑到大模型可能忘了闭合最后那个标签（如 <questions>[...] 后面直接跟了 </arguments>）
+        if not matches:
+            unclosed_pattern = re.compile(r'<([^>/\s]+)>(.*)', re.DOTALL)
+            uncl_match = unclosed_pattern.search(content_to_search)
+            if uncl_match:
+                matches = [uncl_match]
+
+        for tm in matches:
             tag, val = tm.group(1), tm.group(2)
             if tag not in ["name", "arguments", "tool_call"]:
                 val_stripped = val.strip()
+                # 去除可能的遗留标记，如尾部多带了 </arguments>（因为未闭合探测可能扫进去了多余后缀）
+                if val_stripped.endswith('</arguments>'):
+                    val_stripped = val_stripped[:-12].strip()
+                
                 # 尝试解析 JSON 数组或对象
                 if (val_stripped.startswith('{') and val_stripped.endswith('}')) or (val_stripped.startswith('[') and val_stripped.endswith(']')):
                     try:
@@ -1397,6 +1419,18 @@ def parse_tool_call_any(text: str):
                         args[tag] = val_stripped
                 else:
                     args[tag] = val.strip()
+        
+        if args:
+            return name, args
+        
+        # 如果 args 里面依然空空如也，有可能是直接把 JSON 扔在了 <arguments> 里面
+        if content_to_search.strip().startswith('{'):
+            try:
+                args = json.loads(content_to_search.strip())
+                return name, args
+            except:
+                pass
+                
         return name, args
     
     # 2. 如果 XML 没找到 name，尝试传统的 JSON 解析
