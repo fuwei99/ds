@@ -1310,6 +1310,7 @@ def format_tools_to_system_prompt(tools: list) -> str:
     prompt = "### [CRITICAL] TOOL CALLING INSTRUCTIONS\n\n"
     prompt += "If you want to call a tool, you MUST output an XML block wrapped in <tool_call> and </tool_call> tags.\n\n"
     prompt += "DO NOT output any other XML tags except below or markdown tag (eg:```xml) for tool calls.\n\n"
+    prompt += "IMPORTANT: For simple string parameters, place the raw text directly inside the tag (NO escape needed). However, if a parameter expects an Array or Object, you MUST output valid JSON format inside the tag.\n\n"
     prompt += "Format:\n<tool_call>\n"
     prompt += "  <name>tool_name</name>\n"
     prompt += "  <arguments>\n"
@@ -1328,6 +1329,23 @@ def format_tools_to_system_prompt(tools: list) -> str:
     prompt += "  <arguments>\n"
     prompt += "    <filePath>C:\\Users\\zhishang\\Desktop\\app.py</filePath>\n"
     prompt += "    <content>\\nimport os\\n...</content>\n"
+    prompt += "  </arguments>\n"
+    prompt += "</tool_call>\n"
+    prompt += "<tool_call>\n"
+    prompt += "  <name>question</name>\n"
+    prompt += "  <arguments>\n"
+    prompt += "    <questions>\n"
+    prompt += "      [\n"
+    prompt += "        {\n"
+    prompt += "          \"question\": \"你希望按什么方向重写 zhouji_1.tex？\",\n"
+    prompt += "          \"header\": \"重写方向\",\n"
+    prompt += "          \"options\": [\n"
+    prompt += "            {\"label\": \"保持原有结构，润色语言\", \"description\": \"保留现有章节...\"},\n"
+    prompt += "            {\"label\": \"完全自由重写\", \"description\": \"...\"}\n"
+    prompt += "          ]\n"
+    prompt += "        }\n"
+    prompt += "      ]\n"
+    prompt += "    </questions>\n"
     prompt += "  </arguments>\n"
     prompt += "</tool_call>\n\n"
 
@@ -1364,7 +1382,15 @@ def parse_tool_call_any(text: str):
         for tm in tag_pattern.finditer(content_to_search):
             tag, val = tm.group(1), tm.group(2)
             if tag not in ["name", "arguments", "tool_call"]:
-                args[tag] = val.strip()
+                val_stripped = val.strip()
+                # 尝试解析 JSON 数组或对象
+                if (val_stripped.startswith('{') and val_stripped.endswith('}')) or (val_stripped.startswith('[') and val_stripped.endswith(']')):
+                    try:
+                        args[tag] = json.loads(val_stripped)
+                    except json.JSONDecodeError:
+                        args[tag] = val_stripped
+                else:
+                    args[tag] = val.strip()
         return name, args
     
     # 2. 如果 XML 没找到 name，尝试传统的 JSON 解析
