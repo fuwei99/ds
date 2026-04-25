@@ -1954,10 +1954,14 @@ async def chat_completions(request: Request):
                                     
                                     while len(text_buffer) > 0:
                                         if not in_tool_call:
-                                            pos = text_buffer.find("<tool_call>")
+                                            # 支持识别官方 DSML 标签
+                                            pos = text_buffer.find("<|DSML|tool_calls>")
+                                            if pos == -1: pos = text_buffer.find("<tool_call>")
+                                            
                                             if pos != -1:
+                                                tag_len = len("<|DSML|tool_calls>") if text_buffer[pos:pos+2] == "<|" else len("<tool_call>")
                                                 before_text = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到 <tool_call> at pos={pos}, 前置文本='{before_text[:30]}'")
+                                                logger.debug(f"[tool_detect] ✅ 检测到工具开始标签 at pos={pos}, 前置文本='{before_text[:30]}'")
                                                 if before_text:
                                                     final_text += before_text
                                                     delta_obj = {"content": before_text}
@@ -1966,14 +1970,14 @@ async def chat_completions(request: Request):
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 in_tool_call = True
-                                                text_buffer = text_buffer[pos + len("<tool_call>"):]
+                                                text_buffer = text_buffer[pos + tag_len:]
                                             else:
-                                                # Check if ending might be <tool_call> prefix
+                                                # 检查截断情况，防止标签被切断
                                                 safe_len = len(text_buffer)
-                                                for i in range(1, len("<tool_call>")):
-                                                    if text_buffer.endswith("<tool_call>"[:i]):
-                                                        safe_len -= i
-                                                        break
+                                                for tag in ["<|DSML|tool_calls>", "<tool_call>"]:
+                                                    for i in range(1, len(tag)):
+                                                        if text_buffer.endswith(tag[:i]):
+                                                            safe_len = min(safe_len, len(text_buffer) - i)
                                                 safe_text = text_buffer[:safe_len]
                                                 text_buffer = text_buffer[safe_len:]
                                                 if safe_text:
@@ -1985,45 +1989,54 @@ async def chat_completions(request: Request):
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 break # Wait for more data
                                         else:
-                                            pos = text_buffer.find("</tool_call>")
+                                            pos = text_buffer.find("</|DSML|tool_calls>")
+                                            tag_len = len("</|DSML|tool_calls>")
+                                            if pos == -1:
+                                                pos = text_buffer.find("</tool_call>")
+                                                tag_len = len("</tool_call>")
+                                            
                                             if pos != -1:
-                                                tool_json_str = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到 </tool_call>, JSON内容='{tool_json_str.strip()[:80]}'")
-                                                text_buffer = text_buffer[pos + len("</tool_call>"):]
+                                                tool_block_content = text_buffer[:pos]
+                                                logger.debug(f"[tool_detect] ✅ 检测到工具结束标签, 内容长度={len(tool_block_content)}")
+                                                text_buffer = text_buffer[pos + tag_len:]
                                                 in_tool_call = False
                                                 
                                                 try:
-                                                    t_name, t_args_dict = parse_tool_call_any(tool_json_str.strip())
-                                                    if not t_name:
-                                                        raise ValueError("Invalid tool call format")
-                                                    
-                                                    # 将 args_dict 转回 JSON 字符串供客户端使用 (OpenAI 标准)
-                                                    t_args = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
-                                                    
-                                                    delta_obj = {
-                                                        "tool_calls": [{
-                                                            "index": tool_call_index,
-                                                            "id": f"call_{tool_call_index}_{int(time.time())}",
-                                                            "type": "function",
-                                                            "function": {
-                                                                "name": t_name,
-                                                                "arguments": t_args
-                                                            }
-                                                        }]
-                                                    }
-                                                    if not first_chunk_sent:
-                                                        delta_obj["role"] = "assistant"
-                                                        first_chunk_sent = True
-                                                    new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
-                                                    has_tool_calls_streamed = True
-                                                    tool_call_index += 1
+                                                    # 解析可能存在的多个并行的工具调用
+                                                    tool_calls_list = parse_tool_call_any(tool_block_content.strip())
+                                                    if not tool_calls_list:
+                                                        # 虽然没解析出来，但可能是为了兼容性原始输出
+                                                        delta_obj = {"content": f"<tool_call>{tool_block_content}</tool_call>"}
+                                                        new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                                        continue
+
+                                                    for t_call in tool_calls_list:
+                                                        t_name = t_call.get("name")
+                                                        t_args_dict = t_call.get("arguments", {})
+                                                        
+                                                        # 将 args_dict 转回 JSON 字符串供客户端使用 (OpenAI 标准)
+                                                        t_args_str = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
+                                                        
+                                                        delta_obj = {
+                                                            "tool_calls": [{
+                                                                "index": tool_call_index,
+                                                                "id": f"call_{tool_call_index}_{int(time.time())}",
+                                                                "type": "function",
+                                                                "function": {
+                                                                    "name": t_name,
+                                                                    "arguments": t_args_str
+                                                                }
+                                                            }]
+                                                        }
+                                                        if not first_chunk_sent:
+                                                            delta_obj["role"] = "assistant"
+                                                            first_chunk_sent = True
+                                                        new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
+                                                        has_tool_calls_streamed = True
+                                                        tool_call_index += 1
                                                 except Exception as e:
-                                                    logger.warning(f"Failed to parse tool call json: {e}")
-                                                    delta_obj = {"content": f"\n<tool_call>{tool_json_str}</tool_call>\n"}
-                                                    final_text += delta_obj["content"]
-                                                    if not first_chunk_sent:
-                                                        delta_obj["role"] = "assistant"
-                                                        first_chunk_sent = True
+                                                    logger.warning(f"Failed to parse tool call block: {e}")
+                                                    delta_obj = {"content": f"\n[PARSE_ERROR: {tool_block_content}]\n"}
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                             else:
                                                 break # Wait for ending tag
@@ -2197,36 +2210,25 @@ async def chat_completions(request: Request):
                         # --- 检测并解析 tool_calls ---
                         tool_calls = []
                         
-                        while "<tool_call>" in final_content and "</tool_call>" in final_content:
-                            start_idx = final_content.find("<tool_call>")
-                            end_idx = final_content.find("</tool_call>", start_idx)
-                            if end_idx == -1:
-                                break
+                        # 尝试提取 DeepSeek-V4 DSML 或 旧版 XML 格式的工具调用
+                        parsed_calls = parse_tool_call_any(final_content)
+                        for p_call in parsed_calls:
+                            t_name = p_call.get("name")
+                            t_args_dict = p_call.get("arguments", {})
+                            t_args_str = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
                             
-                            json_str = final_content[start_idx + len("<tool_call>"):end_idx].strip()
-                            
-                            try:
-                                parsed = json.loads(json_str)
-                                args = parsed.get("arguments", "{}")
-                                if isinstance(args, dict):
-                                    args = json.dumps(args, ensure_ascii=False)
-                                elif not isinstance(args, str):
-                                    args = str(args)
-                                    
-                                tool_calls.append({
-                                    "id": f"call_{len(tool_calls)}_{int(time.time())}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": parsed.get("name", ""),
-                                        "arguments": args
-                                    }
-                                })
-                            except Exception as e:
-                                logger.warning(f"解析 tool_call 失败: {json_str}, error: {e}")
-                                
-                            # 移除这部分 tool_call
-                            final_content = final_content[:start_idx] + final_content[end_idx + len("</tool_call>"):]
+                            tool_calls.append({
+                                "id": f"call_{len(tool_calls)}_{int(time.time())}",
+                                "type": "function",
+                                "function": {
+                                    "name": t_name,
+                                    "arguments": t_args_str
+                                }
+                            })
                         
+                        # 清理内容中的工具调用块
+                        final_content = re.sub(r'<\|DSML\|tool_calls>.*?</\|DSML\|tool_calls>', '', final_content, flags=re.DOTALL)
+                        final_content = re.sub(r'<tool_call>.*?</tool_call>', '', final_content, flags=re.DOTALL)
                         final_content = final_content.strip()
 
                         # 追加文件信息
