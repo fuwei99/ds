@@ -1369,7 +1369,7 @@ def format_tools_to_system_prompt(tools: list) -> str:
             prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
     
     prompt += "[REPRISES]\n"
-    prompt += "Remember: MUST wrap tool calls in <tool_call> tags. DO NOT use markdown code blocks. NO escape needed for content inside XML tags.\n"
+    prompt += "Remember: MUST wrap tool calls in <tool_call> tags. DO NOT use markdown code blocks. NO escape needed for content inside XML tags. All XML tags MUST be closed. DO NOT omit any closing tags.\n"
     
     return prompt
 
