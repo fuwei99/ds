@@ -1224,7 +1224,7 @@ def list_claude_models():
 # ----------------------------------------------------------------------
 # 消息预处理函数，将多轮对话合并成最终 prompt
 # ----------------------------------------------------------------------
-def messages_prepare(messages: list) -> str:
+def messages_prepare(messages: list, is_tool_call: bool = False) -> str:
     """处理消息列表，合并连续相同角色的消息，并添加角色标签：
     - 对于 assistant 消息，加上 <｜Assistant｜> 前缀及 <｜end▁of▁sentence｜> 结束标签；
     - 对于 user/system 消息（除第一条外）加上 <｜User｜> 前缀；
@@ -1254,6 +1254,12 @@ def messages_prepare(messages: list) -> str:
             merged.append(msg)
     # 添加标签
     parts = []
+    # 找到最后一个 user 消息的索引
+    last_user_idx = -1
+    for i, m in enumerate(merged):
+        if m["role"] == "user":
+            last_user_idx = i
+
     for idx, block in enumerate(merged):
         role = block["role"]
         text = block["text"]
@@ -1262,7 +1268,10 @@ def messages_prepare(messages: list) -> str:
         if role == "system":
             parts.append(f"System:\n{text}")
         elif role == "user":
-            parts.append(f"Human:\n{text}")
+            user_content = f"Human:\n{text}"
+            if is_tool_call and idx == last_user_idx:
+                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n</tool_call>"
+            parts.append(user_content)
         elif role == "assistant":
             if is_last:
                 # Prefill: 在最后一条 assistant 前插入续写约束，并以 <|continue|> 作为续写锚点
@@ -1297,22 +1306,33 @@ KEEP_ALIVE_TIMEOUT = 5
 def format_tools_to_system_prompt(tools: list) -> str:
     if not tools:
         return ""
-    prompt = "You have access to the following functions/tools. You MUST ONLY use the output format described below if you want to use a tool.\n\n"
+    
+    prompt = "### [CRITICAL] TOOL CALLING INSTRUCTIONS\n\n"
+    prompt += "If you want to call a tool, you MUST output a JSON block wrapped in <tool_call> and </tool_call> tags.\n\n"
+    prompt += "DO NOT output any other XML tags or markdown tag (eg:```json) for tool calls.\n\n"
+    prompt += "Format:\n<tool_call>\n"
+    prompt += "{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n"
+    prompt += "</tool_call>\n\n"
+    
+    prompt += "Example:\n<tool_call>\n"
+    prompt += "{\"name\": \"read\", \"arguments\": {\"filePath\": \"C:\\\\Users\\\\zhishang\\\\Desktop\\\\README.md\"}}\n"
+    prompt += "</tool_call>\n"
+    prompt += "<tool_call>\n"
+    prompt += "{\"name\": \"read\", \"arguments\": {\"filePath\": \"C:\\\\Users\\\\zhishang\\\\Desktop\\\\app.py\"}}\n"
+    prompt += "</tool_call>\n\n"
+
+    prompt += "### AVAILABLE TOOLS\n\n"
+    
     for t in tools:
         if t.get("type") == "function":
             func = t.get("function", {})
-            prompt += f"### Tool: `{func.get('name')}`\n"
+            prompt += f"#### Tool: `{func.get('name')}`\n"
             prompt += f"Description: {func.get('description', '')}\n"
             prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
     
-    prompt += """If you want to call a tool, you MUST output a JSON block wrapped in <tool_call> and </tool_call> tags. 
-DO NOT output any other XML tags for tool calls.
-Format:
-<tool_call>
-{"name": "tool_name", "arguments": {"arg1": "value1"}}
-</tool_call>
-
-You can call multiple tools by outputting multiple <tool_call> blocks."""
+    prompt += "[REPRISES]\n"
+    prompt += "Remember: MUST wrap tool calls in <tool_call> tags. DO NOT use markdown code blocks like ```json. MUST NOT include any other text before or after the tool call blocks if you are only calling tools.\n"
+    
     return prompt
 
 def _content_to_str(content) -> str:
@@ -1433,7 +1453,7 @@ async def chat_completions(request: Request):
                      f"existing_files={[f['id'] for f in upload_tags['existing_files']]}")
         
         # 2. 构造 prompt（标签已被清除）
-        final_prompt = messages_prepare(messages)
+        final_prompt = messages_prepare(messages, is_tool_call=bool(tools))
         
         ref_file_ids = []
         uploaded_file_info = None  # 记录本次上传的文件信息 {"name": str, "id": str}
