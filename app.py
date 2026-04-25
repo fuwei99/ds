@@ -1397,7 +1397,8 @@ def parse_tool_call_any(text: str):
         content_to_search = args_section.group(1) if args_section else text
         
         # 匹配所有 <tag>value</tag> 形式，排除一些保留字
-        tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)</\1>', re.DOTALL)
+        # 兼容大模型漏写闭合标签（如缺少 </questions>），只要遇到 </arguments> 或 </tool> 等封口标签即认为本参数结束
+        tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)(?:</\1>|(?=</arguments>)|(?=</tool_call>)|(?=</tool>)|$)', re.DOTALL)
         for tm in tag_pattern.finditer(content_to_search):
             tag, val = tm.group(1), tm.group(2)
             if tag not in ["name", "arguments", "tool_call"]:
