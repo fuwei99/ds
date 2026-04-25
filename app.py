@@ -1270,7 +1270,7 @@ def messages_prepare(messages: list, is_tool_call: bool = False) -> str:
         elif role == "user":
             user_content = f"Human:\n{text}"
             if is_tool_call and idx == last_user_idx:
-                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<tool_call>\n  <tool name=\"tool_name\">\n    <arguments>\n      <param_name>value</param_name>\n    </arguments>\n  </tool>\n</tool_call>"
+                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<|DSML|tool_calls>\n  <|DSML|invoke name=\"tool_name\">\n    <|DSML|parameter name=\"arg\" string=\"true\">val</|DSML|parameter>\n  </|DSML|invoke>\n</|DSML|tool_calls>"
             parts.append(user_content)
         elif role == "assistant":
             if is_last:
@@ -1308,56 +1308,48 @@ def format_tools_to_system_prompt(tools: list) -> str:
         return ""
     
     prompt = "### [CRITICAL] TOOL CALLING INSTRUCTIONS\n\n"
-    prompt += "If you want to call a tool, you MUST output an XML block wrapped in <tool_call> and </tool_call> tags.\n\n"
+    prompt += "If you want to call a tool, you MUST output a block wrapped in <|DSML|tool_calls> and </|DSML|tool_calls> tags.\n\n"
     prompt += "DO NOT output any other XML tags except below or markdown tag (eg:```xml) for tool calls.\n\n"
-    prompt += "IMPORTANT: For simple string parameters, place the raw text directly inside the tag (NO escape needed). However, if a parameter expects an Array or Object, you MUST output valid JSON format inside the tag.\n\n"
-    prompt += "Format:\n<tool_call>\n"
-    prompt += "  <tool name=\"tool_name\">\n"
-    prompt += "    <arguments>\n"
-    prompt += "      <arg_name>value</arg_name>\n"
-    prompt += "    </arguments>\n"
-    prompt += "  </tool>\n"
-    prompt += "</tool_call>\n\n"
+    prompt += "IMPORTANT: For string parameters, set string=\"true\". For other types (numbers, booleans, arrays, objects), pass the value in JSON format and set string=\"false\".\n\n"
+    prompt += "Format:\n<|DSML|tool_calls>\n"
+    prompt += "  <|DSML|invoke name=\"tool_name\">\n"
+    prompt += "    <|DSML|parameter name=\"arg1\" string=\"true\">raw_string_value</|DSML|parameter>\n"
+    prompt += "    <|DSML|parameter name=\"arg2\" string=\"false\">[json, value]</|DSML|parameter>\n"
+    prompt += "  </|DSML|invoke>\n"
+    prompt += "</|DSML|tool_calls>\n\n"
     
-    prompt += "Example:\n<tool_call>\n"
-    prompt += "  <tool name=\"read\">\n"
-    prompt += "    <arguments>\n"
-    prompt += "      <filePath>C:\\Users\\zhishang\\Desktop\\README.md</filePath>\n"
-    prompt += "    </arguments>\n"
-    prompt += "  </tool>\n"
-    prompt += "</tool_call>\n"
-    prompt += "<tool_call>\n"
-    prompt += "  <tool name=\"write\">\n"
-    prompt += "    <arguments>\n"
-    prompt += "      <filePath>C:\\Users\\zhishang\\Desktop\\hello.py</filePath>\n"
-    prompt += "      <content>\n"
+    prompt += "Example:\n<|DSML|tool_calls>\n"
+    prompt += "  <|DSML|invoke name=\"read\">\n"
+    prompt += "    <|DSML|parameter name=\"filePath\" string=\"true\">C:\\Users\\zhishang\\Desktop\\README.md</|DSML|parameter>\n"
+    prompt += "  </|DSML|invoke>\n"
+    prompt += "</|DSML|tool_calls>\n"
+    prompt += "<|DSML|tool_calls>\n"
+    prompt += "  <|DSML|invoke name=\"write\">\n"
+    prompt += "    <|DSML|parameter name=\"filePath\" string=\"true\">C:\\Users\\zhishang\\Desktop\\hello.py</|DSML|parameter>\n"
+    prompt += "    <|DSML|parameter name=\"content\" string=\"true\">\n"
     prompt += "def main():\n"
     prompt += "    print(\"Hello World\")\n"
     prompt += "\n"
     prompt += "if __name__ == \"__main__\":\n"
     prompt += "    main()\n"
-    prompt += "      </content>\n"
-    prompt += "    </arguments>\n"
-    prompt += "  </tool>\n"
-    prompt += "</tool_call>\n"
-    prompt += "<tool_call>\n"
-    prompt += "  <tool name=\"question\">\n"
-    prompt += "    <arguments>\n"
-    prompt += "      <questions>\n"
-    prompt += "        [\n"
-    prompt += "          {\n"
-    prompt += "            \"question\": \"你希望按什么方向重写 zhouji_1.tex？\",\n"
-    prompt += "            \"header\": \"重写方向\",\n"
-    prompt += "            \"options\": [\n"
-    prompt += "              {\"label\": \"保持原有结构，润色语言\", \"description\": \"保留现有章节...\"},\n"
-    prompt += "              {\"label\": \"完全自由重写\", \"description\": \"...\"}\n"
-    prompt += "            ]\n"
-    prompt += "          }\n"
-    prompt += "        ]\n"
-    prompt += "      </questions>\n"
-    prompt += "    </arguments>\n"
-    prompt += "  </tool>\n"
-    prompt += "</tool_call>\n\n"
+    prompt += "    </|DSML|parameter>\n"
+    prompt += "  </|DSML|invoke>\n"
+    prompt += "</|DSML|tool_calls>\n"
+    prompt += "<|DSML|tool_calls>\n"
+    prompt += "  <|DSML|invoke name=\"question\">\n"
+    prompt += "    <|DSML|parameter name=\"questions\" string=\"false\">\n"
+    prompt += "      [\n"
+    prompt += "        {\n"
+    prompt += "          \"question\": \"你希望按什么方向重写？\",\n"
+    prompt += "          \"header\": \"重写方向\",\n"
+    prompt += "          \"options\": [\n"
+    prompt += "            {\"label\": \"保持原有结构\", \"description\": \"...\"}\n"
+    prompt += "          ]\n"
+    prompt += "        }\n"
+    prompt += "      ]\n"
+    prompt += "    </|DSML|parameter>\n"
+    prompt += "  </|DSML|invoke>\n"
+    prompt += "</|DSML|tool_calls>\n\n"
 
     prompt += "### AVAILABLE TOOLS\n\n"
     
@@ -1369,46 +1361,61 @@ def format_tools_to_system_prompt(tools: list) -> str:
             prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
     
     prompt += "[REPRISES]\n"
-    prompt += "Remember: MUST wrap tool calls in <tool_call> tags. DO NOT use markdown code blocks. NO escape needed for content inside XML tags. All XML tags MUST be closed. DO NOT omit any closing tags.\n"
+    prompt += "Remember: MUST wrap tool calls in <|DSML|tool_calls> tags. DO NOT use markdown code blocks. NO escape needed for content inside XML tags. All XML tags MUST be closed. DO NOT omit any closing tags.\n"
     
     return prompt
 
 def parse_tool_call_any(text: str):
     """
-    尝试解析 XML 格式的 tool_call，若失败则尝试解析 JSON。
+    优先尝试解析 DeepSeek-V4 官方 DSML 格式。
     返回 (name, arguments_dict)
     """
-    # 1. 尝试 XML 解析
+    # 1. 官方 DSML 格式解析
+    invoke_match = re.search(r'<\|DSML\|invoke\s+name=["\']([^"\']+)["\']', text)
+    if invoke_match:
+        name = invoke_match.group(1).strip()
+        args = {}
+        # 匹配参数：<|DSML|parameter name="..." string="true/false">...</|DSML|parameter>
+        # 兼容漏写闭合标签
+        param_pattern = re.compile(
+            r'<\|DSML\|parameter\s+name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=<\|DSML\|invoke)|(?=</\|DSML\|tool_calls>)|$)', 
+            re.DOTALL
+        )
+        for pm in param_pattern.finditer(text):
+            p_name, p_is_string, p_val = pm.group(1), pm.group(2).lower() == "true", pm.group(3)
+            if p_is_string:
+                args[p_name] = p_val.strip()
+            else:
+                val_stripped = p_val.strip()
+                try:
+                    args[p_name] = json.loads(val_stripped)
+                except json.JSONDecodeError:
+                    args[p_name] = val_stripped
+        return name, args
+
+    # 2. 回退：尝试旧版 XML 解析
     name = None
     name_match = re.search(r'<name>(.*?)</name>', text, re.DOTALL)
     if name_match:
         name = name_match.group(1).strip()
     else:
-        # 支持模型自然生成的语法，如 <tool name="ask_user"> 或 <tool_call name="ask_user">
         name_match = re.search(r'<(?:tool|tool_call)\s+name=["\']([^"\']+)["\']', text)
         if name_match:
             name = name_match.group(1).strip()
 
     if name:
         args = {}
-        # 寻找 <arguments> 块
-
         args_section = re.search(r'<arguments>(.*?)</arguments>', text, re.DOTALL)
         content_to_search = args_section.group(1) if args_section else text
-        
-        # 匹配所有 <tag>value</tag> 形式，排除一些保留字
-        # 兼容大模型漏写闭合标签（如缺少 </questions>），只要遇到 </arguments> 或 </tool> 等封口标签即认为本参数结束
         tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)(?:</\1>|(?=</arguments>)|(?=</tool_call>)|(?=</tool>)|$)', re.DOTALL)
         for tm in tag_pattern.finditer(content_to_search):
             tag, val = tm.group(1), tm.group(2)
             if tag not in ["name", "arguments", "tool_call"]:
                 val_stripped = val.strip()
-                # 尝试解析 JSON 数组或对象
                 if (val_stripped.startswith('{') and val_stripped.endswith('}')) or (val_stripped.startswith('[') and val_stripped.endswith(']')):
                     try:
                         args[tag] = json.loads(val_stripped)
-                    except json.JSONDecodeError:
-                        args[tag] = val_stripped
+                    except: args[tag] = val_stripped
                 else:
                     args[tag] = val.strip()
         return name, args
@@ -1471,12 +1478,14 @@ def process_messages_for_tools(messages: list) -> list:
                     except:
                         pass
                 
-                # 转换回新的 XML 格式以提供上下文
-                xml_call = "\n<tool_call>\n  <tool name=\"{}\">\n    <arguments>\n".format(func.get("name"))
+                # 转换回 DeepSeek-V4 官方格式以提供上下文
+                xml_call = "\n<|DSML|tool_calls>\n  <|DSML|invoke name=\"{}\">\n".format(func.get("name"))
                 if isinstance(args, dict):
                     for k, v in args.items():
-                        xml_call += "      <{0}>{1}</{0}>\n".format(k, v)
-                xml_call += "    </arguments>\n  </tool>\n</tool_call>\n"
+                        is_string = "true" if not (isinstance(v, (dict, list))) else "false"
+                        val_str = v if is_string == "true" else json.dumps(v, ensure_ascii=False)
+                        xml_call += "    <|DSML|parameter name=\"{0}\" string=\"{1}\">{2}</|DSML|parameter>\n".format(k, is_string, val_str)
+                xml_call += "  </|DSML|invoke>\n</|DSML|tool_calls>\n"
                 content += xml_call
             msg["content"] = content.strip()
             
