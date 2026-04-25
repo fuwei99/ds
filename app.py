@@ -1270,7 +1270,7 @@ def messages_prepare(messages: list, is_tool_call: bool = False) -> str:
         elif role == "user":
             user_content = f"Human:\n{text}"
             if is_tool_call and idx == last_user_idx:
-                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n</tool_call>"
+                user_content += "\n\n[TOOLCALL_FORMAT_REMINDER]:\n<tool_call>\n  <name>tool_name</name>\n  <arguments>\n    <param_name>value</param_name>\n  </arguments>\n</tool_call>"
             parts.append(user_content)
         elif role == "assistant":
             if is_last:
@@ -1308,17 +1308,27 @@ def format_tools_to_system_prompt(tools: list) -> str:
         return ""
     
     prompt = "### [CRITICAL] TOOL CALLING INSTRUCTIONS\n\n"
-    prompt += "If you want to call a tool, you MUST output a JSON block wrapped in <tool_call> and </tool_call> tags.\n\n"
-    prompt += "DO NOT output any other XML tags or markdown tag (eg:```json) for tool calls.\n\n"
+    prompt += "If you want to call a tool, you MUST output an XML block wrapped in <tool_call> and </tool_call> tags.\n\n"
+    prompt += "DO NOT output any other XML tags except below or markdown tag (eg:```xml) for tool calls.\n\n"
     prompt += "Format:\n<tool_call>\n"
-    prompt += "{\"name\": \"tool_name\", \"arguments\": {\"arg1\": \"value1\"}}\n"
+    prompt += "  <name>tool_name</name>\n"
+    prompt += "  <arguments>\n"
+    prompt += "    <arg_name>value</arg_name>\n"
+    prompt += "  </arguments>\n"
     prompt += "</tool_call>\n\n"
     
     prompt += "Example:\n<tool_call>\n"
-    prompt += "{\"name\": \"read\", \"arguments\": {\"filePath\": \"C:\\\\Users\\\\zhishang\\\\Desktop\\\\README.md\"}}\n"
+    prompt += "  <name>read</name>\n"
+    prompt += "  <arguments>\n"
+    prompt += "    <filePath>C:\\Users\\zhishang\\Desktop\\README.md</filePath>\n"
+    prompt += "  </arguments>\n"
     prompt += "</tool_call>\n"
     prompt += "<tool_call>\n"
-    prompt += "{\"name\": \"read\", \"arguments\": {\"filePath\": \"C:\\\\Users\\\\zhishang\\\\Desktop\\\\app.py\"}}\n"
+    prompt += "  <name>write</name>\n"
+    prompt += "  <arguments>\n"
+    prompt += "    <filePath>C:\\Users\\zhishang\\Desktop\\app.py</filePath>\n"
+    prompt += "    <content>\\nimport os\\n...</content>\n"
+    prompt += "  </arguments>\n"
     prompt += "</tool_call>\n\n"
 
     prompt += "### AVAILABLE TOOLS\n\n"
@@ -1331,9 +1341,45 @@ def format_tools_to_system_prompt(tools: list) -> str:
             prompt += f"Parameters: {json.dumps(func.get('parameters', {}), ensure_ascii=False)}\n\n"
     
     prompt += "[REPRISES]\n"
-    prompt += "Remember: MUST wrap tool calls in <tool_call> tags. DO NOT use markdown code blocks like ```json. MUST NOT include any other text before or after the tool call blocks if you are only calling tools.\n"
+    prompt += "Remember: MUST wrap tool calls in <tool_call> tags. DO NOT use markdown code blocks. NO escape needed for content inside XML tags.\n"
     
     return prompt
+
+def parse_tool_call_any(text: str):
+    """
+    尝试解析 XML 格式的 tool_call，若失败则尝试解析 JSON。
+    返回 (name, arguments_dict)
+    """
+    # 1. 尝试 XML 解析
+    name_match = re.search(r'<name>(.*?)</name>', text, re.DOTALL)
+    if name_match:
+        name = name_match.group(1).strip()
+        args = {}
+        # 寻找 <arguments> 块
+        args_section = re.search(r'<arguments>(.*?)</arguments>', text, re.DOTALL)
+        content_to_search = args_section.group(1) if args_section else text
+        
+        # 匹配所有 <tag>value</tag> 形式，排除一些保留字
+        tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)</\1>', re.DOTALL)
+        for tm in tag_pattern.finditer(content_to_search):
+            tag, val = tm.group(1), tm.group(2)
+            if tag not in ["name", "arguments", "tool_call"]:
+                args[tag] = val.strip()
+        return name, args
+    
+    # 2. 如果 XML 没找到 name，尝试传统的 JSON 解析
+    try:
+        # 清洗可能存在的 markdown 代码块
+        clean_json = text.strip()
+        if clean_json.startswith("```json"):
+            clean_json = clean_json[7:]
+        if clean_json.endswith("```"):
+            clean_json = clean_json[:-3]
+        
+        parsed = json.loads(clean_json.strip())
+        return parsed.get("name"), parsed.get("arguments", {})
+    except:
+        return None, None
 
 def _content_to_str(content) -> str:
     """将 content 统一转换为字符串（兼容 OpenAI 多模态 list 格式）"""
@@ -1372,7 +1418,6 @@ def process_messages_for_tools(messages: list) -> list:
             for tc in msg.get("tool_calls"):
                 func = tc.get("function", {})
                 
-                # Handle args correctly, sometimes string sometimes dict
                 args = func.get("arguments", {})
                 if isinstance(args, str):
                     try:
@@ -1380,7 +1425,13 @@ def process_messages_for_tools(messages: list) -> list:
                     except:
                         pass
                 
-                content += f'\n<tool_call>\n{{"name": "{func.get("name")}", "arguments": {json.dumps(args, ensure_ascii=False)}}}\n</tool_call>\n'
+                # 转换回新的 XML 格式以提供上下文
+                xml_call = "\n<tool_call>\n  <name>{}</name>\n  <arguments>\n".format(func.get("name"))
+                if isinstance(args, dict):
+                    for k, v in args.items():
+                        xml_call += "    <{0}>{1}</{0}>\n".format(k, v)
+                xml_call += "  </arguments>\n</tool_call>\n"
+                content += xml_call
             msg["content"] = content.strip()
             
         # 如果是 tool 结果回复
@@ -1887,13 +1938,12 @@ async def chat_completions(request: Request):
                                                 in_tool_call = False
                                                 
                                                 try:
-                                                    parsed = json.loads(tool_json_str.strip())
-                                                    t_name = parsed.get("name", "")
-                                                    t_args = parsed.get("arguments", "{}")
-                                                    if isinstance(t_args, dict):
-                                                        t_args = json.dumps(t_args, ensure_ascii=False)
-                                                    elif not isinstance(t_args, str):
-                                                        t_args = str(t_args)
+                                                    t_name, t_args_dict = parse_tool_call_any(tool_json_str.strip())
+                                                    if not t_name:
+                                                        raise ValueError("Invalid tool call format")
+                                                    
+                                                    # 将 args_dict 转回 JSON 字符串供客户端使用 (OpenAI 标准)
+                                                    t_args = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
                                                     
                                                     delta_obj = {
                                                         "tool_calls": [{
