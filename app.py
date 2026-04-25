@@ -1332,7 +1332,18 @@ def format_tools_to_system_prompt(tools: list) -> str:
     prompt += "    print(\"Hello World\")\n"
     prompt += "</|DSML|parameter>\n"
     prompt += "</|DSML|invoke>\n"
+    prompt += "<|DSML|invoke name=\"question\">\n"
+    prompt += "<|DSML|parameter name=\"questions\" string=\"false\">\n"
+    prompt += "[\n"
+    prompt += "  {\n"
+    prompt += "    \"question\": \"你希望按什么方向重写文件？\",\n"
+    prompt += "    \"options\": [\"润色\", \"精简\", \"重构\"]\n"
+    prompt += "  }\n"
+    prompt += "]\n"
+    prompt += "</|DSML|parameter>\n"
+    prompt += "</|DSML|invoke>\n"
     prompt += "</|DSML|tool_calls>\n\n"
+    prompt += "Note: The above examples are for format demonstration only. Please refer to the \"### Available Tool Schemas\" below for the actual tools and their parameter definitions.\n\n"
 
     prompt += "### Available Tool Schemas\n\n"
     
