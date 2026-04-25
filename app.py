@@ -1365,52 +1365,60 @@ def format_tools_to_system_prompt(tools: list) -> str:
     
     return prompt
 
-def parse_tool_call_any(text: str):
+def parse_tool_call_any(text: str) -> list:
     """
-    优先尝试解析 DeepSeek-V4 官方 DSML 格式。
-    返回 (name, arguments_dict)
+    解析工具调用，支持 DeepSeek-V4 官方格式及旧版 XML/JSON 格式。
+    始终返回列表: [{"name": "xxx", "arguments": {...}}, ...]
     """
-    # 1. 官方 DSML 格式解析
-    invoke_match = re.search(r'<\|DSML\|invoke\s+name=["\']([^"\']+)["\']', text)
-    if invoke_match:
-        name = invoke_match.group(1).strip()
-        args = {}
-        # 匹配参数：<|DSML|parameter name="..." string="true/false">...</|DSML|parameter>
-        # 兼容漏写闭合标签
-        param_pattern = re.compile(
-            r'<\|DSML\|parameter\s+name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=<\|DSML\|invoke)|(?=</\|DSML\|tool_calls>)|$)', 
-            re.DOTALL
-        )
-        for pm in param_pattern.finditer(text):
-            p_name, p_is_string, p_val = pm.group(1), pm.group(2).lower() == "true", pm.group(3)
-            if p_is_string:
-                args[p_name] = p_val.strip()
-            else:
-                val_stripped = p_val.strip()
-                try:
-                    args[p_name] = json.loads(val_stripped)
-                except json.JSONDecodeError:
-                    args[p_name] = val_stripped
-        return name, args
+    results = []
+    
+    # 1. 优先尝试官方 DSML 格式 (支持多 invoke 并行)
+    # 先看有没有整个大容器，没有就直接搜 invoke
+    blocks = re.findall(r'<\|DSML\|tool_calls>(.*?)</\|DSML\|tool_calls>', text, re.DOTALL)
+    search_space = blocks if blocks else [text]
+    
+    for content in search_space:
+        invoke_pattern = re.compile(r'<\|DSML\|invoke\s+name=["\']([^"\']+)["\']>(.*?)(?:</\|DSML\|invoke>|(?=<\|DSML\|invoke)|$)', re.DOTALL)
+        for im in invoke_pattern.finditer(content):
+            name = im.group(1).strip()
+            invoke_inner = im.group(2)
+            args = {}
+            # 提取参数
+            param_pattern = re.compile(
+                r'<\|DSML\|parameter\s+name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=<\|DSML\|parameter)|$)', 
+                re.DOTALL
+            )
+            for pm in param_pattern.finditer(invoke_inner):
+                p_name, p_is_string, p_val = pm.group(1), pm.group(2).lower() == "true", pm.group(3)
+                if p_is_string:
+                    args[p_name] = p_val.strip()
+                else:
+                    stripped = p_val.strip()
+                    try:
+                        args[p_name] = json.loads(stripped)
+                    except:
+                        args[p_name] = stripped
+            if name:
+                results.append({"name": name, "arguments": args})
+            
+    if results:
+        return results
 
-    # 2. 回退：尝试旧版 XML 解析
+    # 2. 回退：尝试旧版 XML 解析 (单请求模式)
     name = None
-    name_match = re.search(r'<name>(.*?)</name>', text, re.DOTALL)
+    name_match = re.search(r'<(?:tool|tool_call)\s+name=["\']([^"\']+)["\']', text)
+    if not name_match:
+        name_match = re.search(r'<name>(.*?)</name>', text, re.DOTALL)
+    
     if name_match:
         name = name_match.group(1).strip()
-    else:
-        name_match = re.search(r'<(?:tool|tool_call)\s+name=["\']([^"\']+)["\']', text)
-        if name_match:
-            name = name_match.group(1).strip()
-
-    if name:
         args = {}
         args_section = re.search(r'<arguments>(.*?)</arguments>', text, re.DOTALL)
         content_to_search = args_section.group(1) if args_section else text
         tag_pattern = re.compile(r'<([^>/\s]+)>(.*?)(?:</\1>|(?=</arguments>)|(?=</tool_call>)|(?=</tool>)|$)', re.DOTALL)
         for tm in tag_pattern.finditer(content_to_search):
             tag, val = tm.group(1), tm.group(2)
-            if tag not in ["name", "arguments", "tool_call"]:
+            if tag not in ["name", "arguments", "tool_call", "tool"]:
                 val_stripped = val.strip()
                 if (val_stripped.startswith('{') and val_stripped.endswith('}')) or (val_stripped.startswith('[') and val_stripped.endswith(']')):
                     try:
@@ -1418,21 +1426,20 @@ def parse_tool_call_any(text: str):
                     except: args[tag] = val_stripped
                 else:
                     args[tag] = val.strip()
-        return name, args
-    
-    # 2. 如果 XML 没找到 name，尝试传统的 JSON 解析
+        return [{"name": name, "arguments": args}]
+
+    # 3. 如果 XML 没找到 name，尝试传统的纯 JSON 解析
     try:
-        # 清洗可能存在的 markdown 代码块
         clean_json = text.strip()
-        if clean_json.startswith("```json"):
-            clean_json = clean_json[7:]
-        if clean_json.endswith("```"):
-            clean_json = clean_json[:-3]
-        
+        if clean_json.startswith("```json"): clean_json = clean_json[7:]
+        if clean_json.endswith("```"): clean_json = clean_json[:-3]
         parsed = json.loads(clean_json.strip())
-        return parsed.get("name"), parsed.get("arguments", {})
+        if isinstance(parsed, dict) and parsed.get("name"):
+            return [{"name": parsed.get("name"), "arguments": parsed.get("arguments", {})}]
     except:
-        return None, None
+        pass
+        
+    return []
 
 def _content_to_str(content) -> str:
     """将 content 统一转换为字符串（兼容 OpenAI 多模态 list 格式）"""
