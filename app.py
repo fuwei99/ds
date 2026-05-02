@@ -1546,6 +1546,10 @@ async def chat_completions(request: Request):
                 system_text += str(c) + "\n"
         system_text = system_text.strip()
         
+        def make_upload_prompt():
+            """构造上传后的 prompt：仅使用 continue"""
+            return "continue"
+
         # 判定针对特定模型的特殊阈值
         custom_upload_threshold = None
         if "expert" in model:
