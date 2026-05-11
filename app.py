@@ -1385,60 +1385,17 @@ def format_tools_to_system_prompt(tools: list) -> str:
     
     return prompt
 
-def canonicalize_dsml_text(text: str) -> str:
-    """
-    参考 ds2api 的鲁棒性处理：归一化各种变形的 DSML 标签。
-    包括：全角符号、多余的符号、漏掉的管道符、不同的标签名变体等。
-    """
-    if not text:
-        return ""
-    
-    # 1. 处理全角符号和常见的中文标点干扰
-    replacements = {
-        '！': '!', '｜': '|', '〈': '<', '〉': '>', '《': '<', '》': '>',
-        '“': '"', '”': '"', '‘': "'", '’': "'", '：': ':', '＝': '=',
-        '␂': '', '␃': '', '\x02': '', '\x03': ''
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    # 2. 归一化标签外壳 (例如把 <<|DSML| 转换成 <|DSML|)
-    text = re.sub(r'<+[!| ]*DSML[!| ]*', r'<|DSML|', text, flags=re.IGNORECASE)
-    text = re.sub(r'/[!| ]*DSML[!| ]*', r'/|DSML|', text, flags=re.IGNORECASE)
-
-    # 3. 容错处理：模型可能写成 <DSML|invoke> 或 <|DSML invoke>
-    # 统一转换成标准格式供正则匹配
-    text = re.sub(r'<\|DSML\|?\s*(tool_calls|invoke|parameter)', r'<|DSML|\1', text, flags=re.IGNORECASE)
-    text = re.sub(r'</\|DSML\|?\s*(tool_calls|invoke|parameter)', r'</|DSML|\1', text, flags=re.IGNORECASE)
-
-    return text
-
 def parse_dsml_tool_calls(text: str) -> list:
     """
     解析 DeepSeek-V4 DSML 格式的多个工具调用。
-    参考 ds2api 的鲁棒解析逻辑，处理各种模型输出异常。
+    返回: [{"name": str, "args": dict}, ...]
     """
     results = []
-    if not text:
-        return results
-
-    # 先进行文本归一化
-    text = canonicalize_dsml_text(text)
     
     # 查找所有的 invoke 块
-    # 容错：允许 invoke name="..." 后面漏掉 >，或者 name 后面多出分隔符
-    invoke_pattern = re.compile(
-        r'<\|DSML\|invoke\s+name=["\']([^"\']+)["\'][^>]*?>(.*?)(?:</\|DSML\|invoke>|(?=<\|DSML\|invoke)|(?=</\|DSML\|tool_calls>)|$)', 
-        re.DOTALL | re.IGNORECASE
-    )
-    
-    # 参数匹配：支持 CDATA，支持漏写闭合标签，支持 string 属性丢失
-    param_pattern = re.compile(
-        r'<\|DSML\|parameter\s+name=["\']([^"\']+)["\'](?:\s+string=["\'](true|false)["\'])?[^>]*?>'  # 开始标签
-        r'(.*?)'  # 内容
-        r'(?:</\|DSML\|parameter>|(?=<\|DSML\|parameter)|(?=</\|DSML\|invoke>)|(?=</\|DSML\|tool_calls>)|$)', # 结束边界
-        re.DOTALL | re.IGNORECASE
-    )
+    invoke_pattern = re.compile(r'<\|DSML\|invoke name=["\']([^"\']+)["\']>(.*?)</\|DSML\|invoke>', re.DOTALL)
+    # 增强版参数匹配，解决漏写闭合标签
+    param_pattern = re.compile(r'<\|DSML\|parameter name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=</\|DSML\|invoke>)|(?=</\|DSML\|tool_calls>)|$)', re.DOTALL)
     
     for inv_match in invoke_pattern.finditer(text):
         tool_name = inv_match.group(1).strip()
@@ -1447,28 +1404,14 @@ def parse_dsml_tool_calls(text: str) -> list:
         args = {}
         for pm in param_pattern.finditer(inv_content):
             p_name = pm.group(1).strip()
-            # 如果模型没写 string="true"，默认按字符串处理
-            is_string = (pm.group(2) or "true").lower() == "true"
+            is_string = pm.group(2).lower() == "true"
             p_val = pm.group(3).strip()
             
-            # 处理 CDATA 包裹
-            if p_val.startswith("<![CDATA[") and p_val.endswith("]]>"):
-                p_val = p_val[9:-3]
-            elif p_val.startswith("<![CDATA["):
-                p_val = p_val[9:]
-                if p_val.endswith("]]"): p_val = p_val[:-2]
-
             if is_string:
                 args[p_name] = p_val
             else:
-                # 尝试解析 JSON，失败则回退到字符串
                 try:
-                    # 容错：有些模型会输出 `true` 而不是 true (JSON)
-                    if p_val.lower() == "true": args[p_name] = True
-                    elif p_val.lower() == "false": args[p_name] = False
-                    elif p_val.lower() == "null": args[p_name] = None
-                    else:
-                        args[p_name] = json.loads(p_val)
+                    args[p_name] = json.loads(p_val)
                 except:
                     args[p_name] = p_val
         
@@ -1999,33 +1942,15 @@ async def chat_completions(request: Request):
                                             first_chunk_sent = True
                                         new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                 elif ctype == "text":
+                                    text_buffer += ctext
                                     logger.debug(f"[tool_detect] 收到文本块: '{ctext[:50]}...' buffer长度={len(text_buffer)}")
                                     
                                     while len(text_buffer) > 0:
                                         if not in_tool_call:
-                                            # 更加鲁棒的检测：支持容错后的标签
-                                            # 先尝试匹配标准标签，再尝试匹配归一化后的候选
-                                            pos = -1
-                                            start_tag = ""
-                                            
-                                            # 候选列表
-                                            candidates = ["<|DSML|tool_calls>", "<tool_calls>", "<DSML|tool_calls>"]
-                                            for cand in candidates:
-                                                p = text_buffer.find(cand)
-                                                if p != -1 and (pos == -1 or p < pos):
-                                                    pos = p
-                                                    start_tag = cand
-                                            
-                                            # 如果没找到，尝试更激进的正则检测（仅当 buffer 够长）
-                                            if pos == -1 and len(text_buffer) > 20:
-                                                match = re.search(r'<+[!| ]*DSML[!| ]*tool_calls[!| ]*>', text_buffer, re.IGNORECASE)
-                                                if match:
-                                                    pos = match.start()
-                                                    start_tag = match.group(0)
-
+                                            pos = text_buffer.find("<|DSML|tool_calls>")
                                             if pos != -1:
                                                 before_text = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] 检测到工具调用开始 at pos={pos}, 标签='{start_tag}'")
+                                                logger.debug(f"[tool_detect] ✅ 检测到 <|DSML|tool_calls> at pos={pos}, 前置文本='{before_text[:30]}'")
                                                 if before_text:
                                                     final_text += before_text
                                                     delta_obj = {"content": before_text}
@@ -2034,18 +1959,15 @@ async def chat_completions(request: Request):
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 in_tool_call = True
-                                                text_buffer = text_buffer[pos + len(start_tag):]
+                                                text_buffer = text_buffer[pos + len("<|DSML|tool_calls>"):]
                                             else:
-                                                # Check if ending might be a partial tool_calls tag
+                                                # Check if ending might be <|DSML|tool_calls> prefix
                                                 safe_len = len(text_buffer)
-                                                # 最长可能的标签前缀
-                                                tag_prefixes = ["<|DSML|", "<tool_calls", "<DSML|"]
-                                                for pref in tag_prefixes:
-                                                    for i in range(1, len(pref)):
-                                                        if text_buffer.endswith(pref[:i]):
-                                                            safe_len = min(safe_len, len(text_buffer) - i)
-                                                            break
-                                                
+                                                tag_start = "<|DSML|tool_calls>"
+                                                for i in range(1, len(tag_start)):
+                                                    if text_buffer.endswith(tag_start[:i]):
+                                                        safe_len -= i
+                                                        break
                                                 safe_text = text_buffer[:safe_len]
                                                 text_buffer = text_buffer[safe_len:]
                                                 if safe_text:
@@ -2057,26 +1979,11 @@ async def chat_completions(request: Request):
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 break # Wait for more data
                                         else:
-                                            # 检测结束标签
-                                            pos = -1
-                                            end_tag = ""
-                                            end_candidates = ["</|DSML|tool_calls>", "</tool_calls>", "</DSML|tool_calls>"]
-                                            for cand in end_candidates:
-                                                p = text_buffer.find(cand)
-                                                if p != -1 and (pos == -1 or p < pos):
-                                                    pos = p
-                                                    end_tag = cand
-                                            
-                                            if pos == -1 and len(text_buffer) > 20:
-                                                match = re.search(r'</[!| ]*DSML[!| ]*tool_calls[!| ]*>', text_buffer, re.IGNORECASE)
-                                                if match:
-                                                    pos = match.start()
-                                                    end_tag = match.group(0)
-
+                                            pos = text_buffer.find("</|DSML|tool_calls>")
                                             if pos != -1:
                                                 tool_content = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] 检测到工具调用结束, 标签='{end_tag}', 内容长度='{len(tool_content)}'")
-                                                text_buffer = text_buffer[pos + len(end_tag):]
+                                                logger.debug(f"[tool_detect] ✅ 检测到 </|DSML|tool_calls>, 内容长度='{len(tool_content)}'")
+                                                text_buffer = text_buffer[pos + len("</|DSML|tool_calls>"):]
                                                 in_tool_call = False
                                                 
                                                 try:
@@ -2287,31 +2194,37 @@ async def chat_completions(request: Request):
                         final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
                         
                         # --- 检测并解析 tool_calls ---
-                        final_content = canonicalize_dsml_text(final_content)
                         tool_calls = []
                         
-                        # 使用更鲁棒的正则查找 tool_calls 块
-                        tool_block_pattern = re.compile(r'<\|DSML\|tool_calls>(.*?)(?:</\|DSML\|tool_calls>|$)', re.DOTALL | re.IGNORECASE)
-                        
-                        for block_match in tool_block_pattern.finditer(final_content):
-                            block_content = block_match.group(1).strip()
-                            calls = parse_dsml_tool_calls(block_content)
-                            for call in calls:
-                                t_name = call["name"]
-                                t_args_dict = call["args"]
-                                t_args = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
-                                
+                        while "<tool_call>" in final_content and "</tool_call>" in final_content:
+                            start_idx = final_content.find("<tool_call>")
+                            end_idx = final_content.find("</tool_call>", start_idx)
+                            if end_idx == -1:
+                                break
+                            
+                            json_str = final_content[start_idx + len("<tool_call>"):end_idx].strip()
+                            
+                            try:
+                                parsed = json.loads(json_str)
+                                args = parsed.get("arguments", "{}")
+                                if isinstance(args, dict):
+                                    args = json.dumps(args, ensure_ascii=False)
+                                elif not isinstance(args, str):
+                                    args = str(args)
+                                    
                                 tool_calls.append({
                                     "id": f"call_{len(tool_calls)}_{int(time.time())}",
                                     "type": "function",
                                     "function": {
-                                        "name": t_name,
-                                        "arguments": t_args
+                                        "name": parsed.get("name", ""),
+                                        "arguments": args
                                     }
                                 })
-                        
-                        # 从正文中移除工具调用标签，保持 content 干净
-                        final_content = re.sub(r'<\|DSML\|tool_calls>.*?(?:</\|DSML\|tool_calls>|$)', '', final_content, flags=re.DOTALL | re.IGNORECASE).strip()
+                            except Exception as e:
+                                logger.warning(f"解析 tool_call 失败: {json_str}, error: {e}")
+                                
+                            # 移除这部分 tool_call
+                            final_content = final_content[:start_idx] + final_content[end_idx + len("</tool_call>"):]
                         
                         final_content = final_content.strip()
 
