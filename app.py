@@ -126,14 +126,12 @@ DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_chall
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 BASE_HEADERS = {
     "Host": "chat.deepseek.com",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Accept-Language": "zh,en-US;q=0.9,en;q=0.8,zh-CN;q=0.7",
+    "User-Agent": "DeepSeek/2.0.4 Android/35",
+    "Accept": "application/json",
     "Content-Type": "application/json",
-    "x-client-platform": "web",
-    "x-client-version": "1.8.0",
-    "x-app-version": "20241129.1",
+    "accept-charset": "UTF-8",
+    "x-client-platform": "android",
+    "x-client-version": "2.0.4",
     "x-client-locale": "zh_CN",
     "x-client-timezone-offset": "28800",
 }
@@ -159,50 +157,69 @@ def get_account_identifier(account):
 # ----------------------------------------------------------------------
 # (3) 登录函数：支持使用 email 或 mobile 登录
 # ----------------------------------------------------------------------
+def normalize_mobile_for_login(raw: str):
+    """参考 ds2api 逻辑格式化手机号"""
+    s = raw.strip()
+    if not s:
+        return "", None
+    
+    # 提取数字
+    digits = "".join(filter(str.isdigit, s))
+    if not digits:
+        return "", None
+    
+    # 如果是 86 开头的 13 位数字（+86... 或 86...）
+    if digits.startswith("86") and len(digits) == 13:
+        return digits[2:], None
+    
+    return digits, None
+
+
 def login_deepseek_via_account(account):
-    """使用 account 中的 email 或 mobile 登录 DeepSeek，
-    成功后将返回的 token 写入 account 并保存至配置文件，返回新 token。
-    """
+    """使用 account 中的 email 或 mobile 登录 DeepSeek (模拟 Android 客户端)"""
     email = account.get("email", "").strip()
     mobile = account.get("mobile", "").strip()
     password = account.get("password", "").strip()
+    
     if not password or (not email and not mobile):
         raise HTTPException(
             status_code=400,
             detail="账号缺少必要的登录信息（必须提供 email 或 mobile 以及 password）",
         )
+    
+    payload = {
+        "password": password,
+        "device_id": "deepseek_to_api",
+        "os": "android",
+    }
+    
     if email:
-        payload = {
-            "email": email,
-            "mobile": "",
-            "password": password,
-            "area_code": "",
-            "device_id": "deepseek_to_api",
-            "os": "web",
-        }
+        payload["email"] = email
     else:
-        payload = {
-            "mobile": mobile,
-            "area_code": "",
-            "password": password,
-            "device_id": "deepseek_to_api",
-            "os": "web",
-        }
+        login_mobile, area_code = normalize_mobile_for_login(mobile)
+        payload["mobile"] = login_mobile
+        if area_code:
+            payload["area_code"] = area_code
+        else:
+            payload["area_code"] = ""
 
     try:
-        resp = requests.post(DEEPSEEK_LOGIN_URL, headers=BASE_HEADERS, json=payload, impersonate="safari15_3")
+        # 模仿 ds2api 使用 android 模拟
+        resp = requests.post(DEEPSEEK_LOGIN_URL, headers=BASE_HEADERS, json=payload, impersonate="chrome110")
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"[login_deepseek_via_account] 登录请求异常: {e}")
-        raise HTTPException(status_code=500, detail="Account login failed: 请求异常")
+        raise HTTPException(status_code=500, detail=f"Account login failed: {str(e)}")
+    
     try:
-        logger.warning(f"[login_deepseek_via_account] {resp.text}")
         data = resp.json()
+        logger.info(f"[login_deepseek_via_account] 登录响应: {data.get('msg') or '成功'}")
     except Exception as e:
         logger.error(f"[login_deepseek_via_account] JSON解析失败: {e}")
         raise HTTPException(
             status_code=500, detail="Account login failed: invalid JSON response"
         )
+
     # 校验响应数据格式是否正确
     if (
         data.get("data") is None
