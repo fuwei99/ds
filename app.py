@@ -124,7 +124,6 @@ DEEPSEEK_LOGIN_URL = f"https://{DEEPSEEK_HOST}/api/v0/users/login"
 DEEPSEEK_CREATE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/create"
 DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_challenge"
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
-DEEPSEEK_CONTINUE_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/continue"
 BASE_HEADERS = {
     "Host": "chat.deepseek.com",
     "User-Agent": "DeepSeek/2.0.4 Android/35",
@@ -1749,11 +1748,6 @@ async def chat_completions(request: Request):
                     in_tool_call = False
                     has_tool_calls_streamed = False
                     tool_call_index = 0
-                    
-                    # 续写相关状态
-                    current_message_id = None
-                    auto_continue_count = 0
-                    MAX_AUTO_CONTINUE = 8
 
                     def process_data():
                         ptype = "text"
@@ -1816,29 +1810,10 @@ async def chat_completions(request: Request):
                                             v = packet.get("v")
 
                                             # 1. 检测结束信号 (FINISHED)
-                                            status_val = v if (p == "response/status" or p == "status" or p == "quasi_status") else None
-                                            if not status_val and isinstance(v, dict):
-                                                status_val = v.get("status")
-
-                                            if status_val:
-                                                if status_val == "FINISHED":
-                                                    result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                                    result_queue.put(None)
-                                                    return True
-                                                elif status_val in ["INCOMPLETE", "AUTO_CONTINUE"]:
-                                                    # 触发自动续写信号
-                                                    result_queue.put({"type": "continue_signal"})
-                                                    return False
-
-                                            # 2. 提取 message_id (续写需要)
-                                            msg_id = None
-                                            if p == "response_message_id":
-                                                msg_id = v
-                                            elif isinstance(v, dict) and "message_id" in v:
-                                                msg_id = v.get("message_id")
-                                            
-                                            if msg_id:
-                                                result_queue.put({"type": "message_id_update", "value": msg_id})
+                                            if (p == "response/status" or p == "status" or p == "quasi_status") and v == "FINISHED":
+                                                result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
+                                                result_queue.put(None)
+                                                return True # 信号：需要终止外部循环
 
                                             # 2. 处理 BATCH (递归处理里面的每一个子项)
                                             if o == "BATCH" and isinstance(v, list):
@@ -1937,67 +1912,7 @@ async def chat_completions(request: Request):
                         try:
                             # 增加 timeout 以便定期发送 keep-alive
                             chunk = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT/2)
-                            
-                            # 处理非标准 chunk (续写信号)
-                            if isinstance(chunk, dict) and "type" in chunk:
-                                if chunk["type"] == "message_id_update":
-                                    current_message_id = chunk["value"]
-                                    continue
-                                elif chunk["type"] == "continue_signal":
-                                    if auto_continue_count < MAX_AUTO_CONTINUE and current_message_id:
-                                        auto_continue_count += 1
-                                        logger.info(f"[auto_continue] 🚀 触发第 {auto_continue_count} 次自动续写, session_id={chat_session_id}, msg_id={current_message_id}")
-                                        
-                                        # 构造续写请求 payload
-                                        continue_payload = {
-                                            "chat_session_id": chat_session_id,
-                                            "message_id": current_message_id,
-                                            "fallback_to_resume": True
-                                        }
-                                        
-                                        # 启动新的线程来请求 continue 接口
-                                        def continue_request():
-                                            try:
-                                                # 获取最新的 POW
-                                                pow_resp = get_pow_response(DEEPSEEK_CONTINUE_URL, request.state.deepseek_token)
-                                                c_headers = get_auth_headers(request)
-                                                c_headers["x-ds-pow-response"] = pow_resp
-                                                
-                                                c_resp = requests.post(
-                                                    DEEPSEEK_CONTINUE_URL,
-                                                    headers=c_headers,
-                                                    json=continue_payload,
-                                                    stream=True,
-                                                    timeout=120,
-                                                    impersonate="chrome110"
-                                                )
-                                                c_resp.raise_for_status()
-                                                
-                                                # 递归调用相同的解析逻辑处理续写流
-                                                for c_line in c_resp.iter_lines():
-                                                    if not c_line: continue
-                                                    c_line_str = c_line.decode("utf-8")
-                                                    if c_line_str.startswith("data:"):
-                                                        c_data_str = c_line_str[5:].strip()
-                                                        if c_data_str == "[DONE]": continue
-                                                        try:
-                                                            c_chunk = json.loads(c_data_str)
-                                                            if "v" in c_chunk:
-                                                                process_packet(c_chunk.get("v", {}))
-                                                        except: pass
-                                            except Exception as e:
-                                                logger.error(f"[auto_continue] 续写请求失败: {e}")
-                                                result_queue.put(None) # 彻底结束
-                                        
-                                        threading.Thread(target=continue_request).start()
-                                        continue
-                                    else:
-                                        # 达到上限或缺少 ID，作为普通结束处理
-                                        result_queue.put(None)
-                                        continue
-
                             if chunk is None:
-                                # ... (此处代码省略，保持原有逻辑)
                                 if text_buffer:
                                     final_text += text_buffer
                                     if not has_tool_calls_streamed:
