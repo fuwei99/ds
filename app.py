@@ -124,6 +124,7 @@ DEEPSEEK_LOGIN_URL = f"https://{DEEPSEEK_HOST}/api/v0/users/login"
 DEEPSEEK_CREATE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/create"
 DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_challenge"
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
+DEEPSEEK_CONTINUE_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/continue"
 BASE_HEADERS = {
     "Host": "chat.deepseek.com",
     "User-Agent": "DeepSeek/2.0.4 Android/35",
@@ -1385,17 +1386,60 @@ def format_tools_to_system_prompt(tools: list) -> str:
     
     return prompt
 
+def canonicalize_dsml_text(text: str) -> str:
+    """
+    参考 ds2api 的鲁棒性处理：归一化各种变形的 DSML 标签。
+    包括：全角符号、多余的符号、漏掉的管道符、不同的标签名变体等。
+    """
+    if not text:
+        return ""
+    
+    # 1. 处理全角符号和常见的中文标点干扰
+    replacements = {
+        '！': '!', '｜': '|', '〈': '<', '〉': '>', '《': '<', '》': '>',
+        '“': '"', '”': '"', '‘': "'", '’': "'", '：': ':', '＝': '=',
+        '␂': '', '␃': '', '\x02': '', '\x03': ''
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # 2. 归一化标签外壳 (例如把 <<|DSML| 转换成 <|DSML|)
+    text = re.sub(r'<+[!| ]*DSML[!| ]*', r'<|DSML|', text, flags=re.IGNORECASE)
+    text = re.sub(r'/[!| ]*DSML[!| ]*', r'/|DSML|', text, flags=re.IGNORECASE)
+
+    # 3. 容错处理：模型可能写成 <DSML|invoke> 或 <|DSML invoke>
+    # 统一转换成标准格式供正则匹配
+    text = re.sub(r'<\|DSML\|?\s*(tool_calls|invoke|parameter)', r'<|DSML|\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'</\|DSML\|?\s*(tool_calls|invoke|parameter)', r'</|DSML|\1', text, flags=re.IGNORECASE)
+
+    return text
+
 def parse_dsml_tool_calls(text: str) -> list:
     """
     解析 DeepSeek-V4 DSML 格式的多个工具调用。
-    返回: [{"name": str, "args": dict}, ...]
+    参考 ds2api 的鲁棒解析逻辑，处理各种模型输出异常。
     """
     results = []
+    if not text:
+        return results
+
+    # 先进行文本归一化
+    text = canonicalize_dsml_text(text)
     
     # 查找所有的 invoke 块
-    invoke_pattern = re.compile(r'<\|DSML\|invoke name=["\']([^"\']+)["\']>(.*?)</\|DSML\|invoke>', re.DOTALL)
-    # 增强版参数匹配，解决漏写闭合标签
-    param_pattern = re.compile(r'<\|DSML\|parameter name=["\']([^"\']+)["\']\s+string=["\'](true|false)["\']>(.*?)(?:</\|DSML\|parameter>|(?=</\|DSML\|invoke>)|(?=</\|DSML\|tool_calls>)|$)', re.DOTALL)
+    # 容错：允许 invoke name="..." 后面漏掉 >，或者 name 后面多出分隔符
+    invoke_pattern = re.compile(
+        r'<\|DSML\|invoke\s+name=["\']([^"\']+)["\'][^>]*?>(.*?)(?:</\|DSML\|invoke>|(?=<\|DSML\|invoke)|(?=</\|DSML\|tool_calls>)|$)', 
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    # 参数匹配：支持 CDATA，支持漏写闭合标签，支持 string 属性丢失
+    param_pattern = re.compile(
+        r'<\|DSML\|parameter\s+name=["\']([^"\']+)["\'](?:\s+string=["\'](true|false)["\'])?[^>]*?>'  # 开始标签
+        r'(.*?)'  # 内容
+        r'(?:</\|DSML\|parameter>|(?=<\|DSML\|parameter)|(?=</\|DSML\|invoke>)|(?=</\|DSML\|tool_calls>)|$)', # 结束边界
+        re.DOTALL | re.IGNORECASE
+    )
     
     for inv_match in invoke_pattern.finditer(text):
         tool_name = inv_match.group(1).strip()
@@ -1404,14 +1448,28 @@ def parse_dsml_tool_calls(text: str) -> list:
         args = {}
         for pm in param_pattern.finditer(inv_content):
             p_name = pm.group(1).strip()
-            is_string = pm.group(2).lower() == "true"
+            # 如果模型没写 string="true"，默认按字符串处理
+            is_string = (pm.group(2) or "true").lower() == "true"
             p_val = pm.group(3).strip()
             
+            # 处理 CDATA 包裹
+            if p_val.startswith("<![CDATA[") and p_val.endswith("]]>"):
+                p_val = p_val[9:-3]
+            elif p_val.startswith("<![CDATA["):
+                p_val = p_val[9:]
+                if p_val.endswith("]]"): p_val = p_val[:-2]
+
             if is_string:
                 args[p_name] = p_val
             else:
+                # 尝试解析 JSON，失败则回退到字符串
                 try:
-                    args[p_name] = json.loads(p_val)
+                    # 容错：有些模型会输出 `true` 而不是 true (JSON)
+                    if p_val.lower() == "true": args[p_name] = True
+                    elif p_val.lower() == "false": args[p_name] = False
+                    elif p_val.lower() == "null": args[p_name] = None
+                    else:
+                        args[p_name] = json.loads(p_val)
                 except:
                     args[p_name] = p_val
         
@@ -1691,6 +1749,11 @@ async def chat_completions(request: Request):
                     in_tool_call = False
                     has_tool_calls_streamed = False
                     tool_call_index = 0
+                    
+                    # 续写相关状态
+                    current_message_id = None
+                    auto_continue_count = 0
+                    MAX_AUTO_CONTINUE = 8
 
                     def process_data():
                         ptype = "text"
@@ -1753,10 +1816,29 @@ async def chat_completions(request: Request):
                                             v = packet.get("v")
 
                                             # 1. 检测结束信号 (FINISHED)
-                                            if (p == "response/status" or p == "status" or p == "quasi_status") and v == "FINISHED":
-                                                result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
-                                                result_queue.put(None)
-                                                return True # 信号：需要终止外部循环
+                                            status_val = v if (p == "response/status" or p == "status" or p == "quasi_status") else None
+                                            if not status_val and isinstance(v, dict):
+                                                status_val = v.get("status")
+
+                                            if status_val:
+                                                if status_val == "FINISHED":
+                                                    result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
+                                                    result_queue.put(None)
+                                                    return True
+                                                elif status_val in ["INCOMPLETE", "AUTO_CONTINUE"]:
+                                                    # 触发自动续写信号
+                                                    result_queue.put({"type": "continue_signal"})
+                                                    return False
+
+                                            # 2. 提取 message_id (续写需要)
+                                            msg_id = None
+                                            if p == "response_message_id":
+                                                msg_id = v
+                                            elif isinstance(v, dict) and "message_id" in v:
+                                                msg_id = v.get("message_id")
+                                            
+                                            if msg_id:
+                                                result_queue.put({"type": "message_id_update", "value": msg_id})
 
                                             # 2. 处理 BATCH (递归处理里面的每一个子项)
                                             if o == "BATCH" and isinstance(v, list):
@@ -1855,7 +1937,67 @@ async def chat_completions(request: Request):
                         try:
                             # 增加 timeout 以便定期发送 keep-alive
                             chunk = result_queue.get(timeout=KEEP_ALIVE_TIMEOUT/2)
+                            
+                            # 处理非标准 chunk (续写信号)
+                            if isinstance(chunk, dict) and "type" in chunk:
+                                if chunk["type"] == "message_id_update":
+                                    current_message_id = chunk["value"]
+                                    continue
+                                elif chunk["type"] == "continue_signal":
+                                    if auto_continue_count < MAX_AUTO_CONTINUE and current_message_id:
+                                        auto_continue_count += 1
+                                        logger.info(f"[auto_continue] 🚀 触发第 {auto_continue_count} 次自动续写, session_id={chat_session_id}, msg_id={current_message_id}")
+                                        
+                                        # 构造续写请求 payload
+                                        continue_payload = {
+                                            "chat_session_id": chat_session_id,
+                                            "message_id": current_message_id,
+                                            "fallback_to_resume": True
+                                        }
+                                        
+                                        # 启动新的线程来请求 continue 接口
+                                        def continue_request():
+                                            try:
+                                                # 获取最新的 POW
+                                                pow_resp = get_pow_response(DEEPSEEK_CONTINUE_URL, request.state.deepseek_token)
+                                                c_headers = get_auth_headers(request)
+                                                c_headers["x-ds-pow-response"] = pow_resp
+                                                
+                                                c_resp = requests.post(
+                                                    DEEPSEEK_CONTINUE_URL,
+                                                    headers=c_headers,
+                                                    json=continue_payload,
+                                                    stream=True,
+                                                    timeout=120,
+                                                    impersonate="chrome110"
+                                                )
+                                                c_resp.raise_for_status()
+                                                
+                                                # 递归调用相同的解析逻辑处理续写流
+                                                for c_line in c_resp.iter_lines():
+                                                    if not c_line: continue
+                                                    c_line_str = c_line.decode("utf-8")
+                                                    if c_line_str.startswith("data:"):
+                                                        c_data_str = c_line_str[5:].strip()
+                                                        if c_data_str == "[DONE]": continue
+                                                        try:
+                                                            c_chunk = json.loads(c_data_str)
+                                                            if "v" in c_chunk:
+                                                                process_packet(c_chunk.get("v", {}))
+                                                        except: pass
+                                            except Exception as e:
+                                                logger.error(f"[auto_continue] 续写请求失败: {e}")
+                                                result_queue.put(None) # 彻底结束
+                                        
+                                        threading.Thread(target=continue_request).start()
+                                        continue
+                                    else:
+                                        # 达到上限或缺少 ID，作为普通结束处理
+                                        result_queue.put(None)
+                                        continue
+
                             if chunk is None:
+                                # ... (此处代码省略，保持原有逻辑)
                                 if text_buffer:
                                     final_text += text_buffer
                                     if not has_tool_calls_streamed:
@@ -1942,15 +2084,33 @@ async def chat_completions(request: Request):
                                             first_chunk_sent = True
                                         new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                 elif ctype == "text":
-                                    text_buffer += ctext
                                     logger.debug(f"[tool_detect] 收到文本块: '{ctext[:50]}...' buffer长度={len(text_buffer)}")
                                     
                                     while len(text_buffer) > 0:
                                         if not in_tool_call:
-                                            pos = text_buffer.find("<|DSML|tool_calls>")
+                                            # 更加鲁棒的检测：支持容错后的标签
+                                            # 先尝试匹配标准标签，再尝试匹配归一化后的候选
+                                            pos = -1
+                                            start_tag = ""
+                                            
+                                            # 候选列表
+                                            candidates = ["<|DSML|tool_calls>", "<tool_calls>", "<DSML|tool_calls>"]
+                                            for cand in candidates:
+                                                p = text_buffer.find(cand)
+                                                if p != -1 and (pos == -1 or p < pos):
+                                                    pos = p
+                                                    start_tag = cand
+                                            
+                                            # 如果没找到，尝试更激进的正则检测（仅当 buffer 够长）
+                                            if pos == -1 and len(text_buffer) > 20:
+                                                match = re.search(r'<+[!| ]*DSML[!| ]*tool_calls[!| ]*>', text_buffer, re.IGNORECASE)
+                                                if match:
+                                                    pos = match.start()
+                                                    start_tag = match.group(0)
+
                                             if pos != -1:
                                                 before_text = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到 <|DSML|tool_calls> at pos={pos}, 前置文本='{before_text[:30]}'")
+                                                logger.debug(f"[tool_detect] 检测到工具调用开始 at pos={pos}, 标签='{start_tag}'")
                                                 if before_text:
                                                     final_text += before_text
                                                     delta_obj = {"content": before_text}
@@ -1959,15 +2119,18 @@ async def chat_completions(request: Request):
                                                         first_chunk_sent = True
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 in_tool_call = True
-                                                text_buffer = text_buffer[pos + len("<|DSML|tool_calls>"):]
+                                                text_buffer = text_buffer[pos + len(start_tag):]
                                             else:
-                                                # Check if ending might be <|DSML|tool_calls> prefix
+                                                # Check if ending might be a partial tool_calls tag
                                                 safe_len = len(text_buffer)
-                                                tag_start = "<|DSML|tool_calls>"
-                                                for i in range(1, len(tag_start)):
-                                                    if text_buffer.endswith(tag_start[:i]):
-                                                        safe_len -= i
-                                                        break
+                                                # 最长可能的标签前缀
+                                                tag_prefixes = ["<|DSML|", "<tool_calls", "<DSML|"]
+                                                for pref in tag_prefixes:
+                                                    for i in range(1, len(pref)):
+                                                        if text_buffer.endswith(pref[:i]):
+                                                            safe_len = min(safe_len, len(text_buffer) - i)
+                                                            break
+                                                
                                                 safe_text = text_buffer[:safe_len]
                                                 text_buffer = text_buffer[safe_len:]
                                                 if safe_text:
@@ -1979,11 +2142,26 @@ async def chat_completions(request: Request):
                                                     new_choices.append({"delta": delta_obj, "index": choice.get("index", 0)})
                                                 break # Wait for more data
                                         else:
-                                            pos = text_buffer.find("</|DSML|tool_calls>")
+                                            # 检测结束标签
+                                            pos = -1
+                                            end_tag = ""
+                                            end_candidates = ["</|DSML|tool_calls>", "</tool_calls>", "</DSML|tool_calls>"]
+                                            for cand in end_candidates:
+                                                p = text_buffer.find(cand)
+                                                if p != -1 and (pos == -1 or p < pos):
+                                                    pos = p
+                                                    end_tag = cand
+                                            
+                                            if pos == -1 and len(text_buffer) > 20:
+                                                match = re.search(r'</[!| ]*DSML[!| ]*tool_calls[!| ]*>', text_buffer, re.IGNORECASE)
+                                                if match:
+                                                    pos = match.start()
+                                                    end_tag = match.group(0)
+
                                             if pos != -1:
                                                 tool_content = text_buffer[:pos]
-                                                logger.debug(f"[tool_detect] ✅ 检测到 </|DSML|tool_calls>, 内容长度='{len(tool_content)}'")
-                                                text_buffer = text_buffer[pos + len("</|DSML|tool_calls>"):]
+                                                logger.debug(f"[tool_detect] 检测到工具调用结束, 标签='{end_tag}', 内容长度='{len(tool_content)}'")
+                                                text_buffer = text_buffer[pos + len(end_tag):]
                                                 in_tool_call = False
                                                 
                                                 try:
@@ -2194,37 +2372,31 @@ async def chat_completions(request: Request):
                         final_reasoning = "".join(think_list)  # 修复：应该使用think_list而不是text_list
                         
                         # --- 检测并解析 tool_calls ---
+                        final_content = canonicalize_dsml_text(final_content)
                         tool_calls = []
                         
-                        while "<tool_call>" in final_content and "</tool_call>" in final_content:
-                            start_idx = final_content.find("<tool_call>")
-                            end_idx = final_content.find("</tool_call>", start_idx)
-                            if end_idx == -1:
-                                break
-                            
-                            json_str = final_content[start_idx + len("<tool_call>"):end_idx].strip()
-                            
-                            try:
-                                parsed = json.loads(json_str)
-                                args = parsed.get("arguments", "{}")
-                                if isinstance(args, dict):
-                                    args = json.dumps(args, ensure_ascii=False)
-                                elif not isinstance(args, str):
-                                    args = str(args)
-                                    
+                        # 使用更鲁棒的正则查找 tool_calls 块
+                        tool_block_pattern = re.compile(r'<\|DSML\|tool_calls>(.*?)(?:</\|DSML\|tool_calls>|$)', re.DOTALL | re.IGNORECASE)
+                        
+                        for block_match in tool_block_pattern.finditer(final_content):
+                            block_content = block_match.group(1).strip()
+                            calls = parse_dsml_tool_calls(block_content)
+                            for call in calls:
+                                t_name = call["name"]
+                                t_args_dict = call["args"]
+                                t_args = json.dumps(t_args_dict, ensure_ascii=False) if isinstance(t_args_dict, dict) else str(t_args_dict)
+                                
                                 tool_calls.append({
                                     "id": f"call_{len(tool_calls)}_{int(time.time())}",
                                     "type": "function",
                                     "function": {
-                                        "name": parsed.get("name", ""),
-                                        "arguments": args
+                                        "name": t_name,
+                                        "arguments": t_args
                                     }
                                 })
-                            except Exception as e:
-                                logger.warning(f"解析 tool_call 失败: {json_str}, error: {e}")
-                                
-                            # 移除这部分 tool_call
-                            final_content = final_content[:start_idx] + final_content[end_idx + len("</tool_call>"):]
+                        
+                        # 从正文中移除工具调用标签，保持 content 干净
+                        final_content = re.sub(r'<\|DSML\|tool_calls>.*?(?:</\|DSML\|tool_calls>|$)', '', final_content, flags=re.DOTALL | re.IGNORECASE).strip()
                         
                         final_content = final_content.strip()
 
