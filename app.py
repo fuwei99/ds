@@ -1,3 +1,4 @@
+from datetime import datetime
 import base64
 import ctypes
 import json
@@ -154,9 +155,26 @@ def get_account_identifier(account):
     return account.get("email", "").strip() or account.get("mobile", "").strip()
 
 
-# ----------------------------------------------------------------------
-# (3) 登录函数：支持使用 email 或 mobile 登录
-# ----------------------------------------------------------------------
+def check_mute_status(data, account):
+    """
+    检查响应数据中是否包含禁言信息 (biz_code: 5)
+    如果是，更新账号状态并持久化。
+    """
+    if not isinstance(data, dict) or not account:
+        return False
+        
+    biz_code = data.get("data", {}).get("biz_code")
+    if biz_code == 5:
+        biz_data = data.get("data", {}).get("biz_data", {})
+        mute_until = biz_data.get("mute_until", 0)
+        acc_id = get_account_identifier(account)
+        
+        account["muted"] = True
+        account["mute_until"] = mute_until
+        logger.warning(f"⚠️ 账号 {acc_id} 已被禁言至 {datetime.fromtimestamp(mute_until).strftime('%Y-%m-%d %H:%M:%S')}")
+        save_config(CONFIG)
+        return True
+    return False
 def normalize_mobile_for_login(raw: str):
     """参考 ds2api 逻辑格式化手机号"""
     s = raw.strip()
@@ -213,6 +231,8 @@ def login_deepseek_via_account(account):
     
     try:
         data = resp.json()
+        # 登录时也检查禁言状态
+        check_mute_status(data, account)
         logger.info(f"[login_deepseek_via_account] 登录响应: {data.get('msg') or '成功'}")
     except Exception as e:
         logger.error(f"[login_deepseek_via_account] JSON解析失败: {e}")
@@ -247,33 +267,62 @@ def login_deepseek_via_account(account):
 def choose_new_account(exclude_ids=None, preferred_email=None):
     """选择策略：
     1. 如果指定了 preferred_email，优先寻找该账号
-    2. 否则按原顺序遍历队列，找到第一个未被 exclude_ids 包含的账号
+    2. 否则按原顺序遍历队列，找到第一个满足条件的账号：
+       - 不在 exclude_ids 中
+       - active 不为 False
+       - muted 为 False (或已到解封时间)
     3. 从队列中移除该账号并返回
     """
     if exclude_ids is None:
         exclude_ids = []
     
+    current_time = time.time()
+    
+    def is_account_available(acc):
+        # 检查 active 状态
+        if acc.get("active") is False:
+            return False
+            
+        # 检查是否在排除列表中
+        acc_id = get_account_identifier(acc)
+        if acc_id in exclude_ids:
+            return False
+            
+        # 检查禁言状态
+        if acc.get("muted"):
+            mute_until = acc.get("mute_until", 0)
+            if current_time > mute_until:
+                # 自动解封
+                acc["muted"] = False
+                acc["mute_until"] = 0
+                logger.info(f"[choose_new_account] 账号 {acc_id} 禁言已到期，自动解除")
+                save_config(CONFIG)
+                return True
+            return False
+            
+        return True
+
     # --- 策略 A: 优先尝试锁定指定账号 ---
     if preferred_email:
         for i in range(len(account_queue)):
             acc = account_queue[i]
             if acc.get("email") == preferred_email:
-                acc_id = get_account_identifier(acc)
-                if acc_id not in exclude_ids:
-                    logger.info(f"[choose_new_account] 锁定首选账号: {acc_id}")
+                if is_account_available(acc):
+                    logger.info(f"[choose_new_account] 锁定首选账号: {preferred_email}")
                     return account_queue.pop(i)
         logger.info(f"[choose_new_account] 未找到可用的首选账号 {preferred_email}，回退到随机模式")
 
     # --- 策略 B: 常规轮询 ---
     for i in range(len(account_queue)):
         acc = account_queue[i]
-        acc_id = get_account_identifier(acc)
-        if acc_id and acc_id not in exclude_ids:
+        if is_account_available(acc):
+            acc_id = get_account_identifier(acc)
+            acc["last_used"] = time.time() # 更新使用时间
             # 从队列中移除并返回
             logger.info(f"[choose_new_account] 新选择账号: {acc_id}")
             return account_queue.pop(i)
 
-    logger.warning("[choose_new_account] 没有可用的账号或所有账号都在使用中")
+    logger.warning("[choose_new_account] 没有可用的账号或所有账号都在使用中/被禁言")
     return None
 
 
@@ -805,8 +854,12 @@ def resolve_model_params(model_name: str):
     # 2. Search
     search_enabled = "search" in model_lower
     
-    # 3. Model Type (default / expert)
-    model_type = "expert" if "expert" in model_lower else "default"
+    # 3. Model Type (default / expert / vision)
+    if "vision" in model_lower:
+        model_type = "vision"
+        thinking_enabled = False # Vision 模式下通常关闭思维链
+    else:
+        model_type = "expert" if "expert" in model_lower else "default"
     
     return thinking_enabled, search_enabled, model_type
 
@@ -927,6 +980,31 @@ def create_session(request: Request, max_attempts=3):
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
             biz_data = data.get("data", {}).get("biz_data", {})
+            # 检查是否被禁言
+            if check_mute_status(data, request.state.account if hasattr(request.state, 'account') else None):
+                resp.close()
+                if request.state.use_config_token:
+                    # 触发换号逻辑
+                    current_acc = request.state.account
+                    current_id = get_account_identifier(current_acc)
+                    if not hasattr(request.state, "tried_accounts"):
+                        request.state.tried_accounts = []
+                    if current_id not in request.state.tried_accounts:
+                        request.state.tried_accounts.append(current_id)
+                    
+                    new_account = choose_new_account(request.state.tried_accounts)
+                    if new_account:
+                        try:
+                            new_token = login_deepseek_via_account(new_account)
+                            request.state.account = new_account
+                            request.state.deepseek_token = new_token
+                            logger.info(f"[create_session] 账号禁言，已切换至新账号: {get_account_identifier(new_account)}")
+                            attempts += 1
+                            continue
+                        except Exception as e:
+                            logger.error(f"[create_session] 切换账号登录失败: {e}")
+                    break # 无可用账号或登录失败
+            
             session_id = biz_data.get("chat_session", {}).get("id")
             if not session_id:
                 # 兼容旧版本结构或备选方案
@@ -1106,6 +1184,30 @@ def get_pow_response(request: Request, max_attempts=3):
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
             biz_data = data.get("data", {}).get("biz_data", {})
+            # 检查是否被禁言
+            if check_mute_status(data, request.state.account if hasattr(request.state, 'account') else None):
+                resp.close()
+                if request.state.use_config_token:
+                    current_acc = request.state.account
+                    current_id = get_account_identifier(current_acc)
+                    if not hasattr(request.state, "tried_accounts"):
+                        request.state.tried_accounts = []
+                    if current_id not in request.state.tried_accounts:
+                        request.state.tried_accounts.append(current_id)
+
+                    new_account = choose_new_account(request.state.tried_accounts)
+                    if new_account:
+                        try:
+                            new_token = login_deepseek_via_account(new_account)
+                            request.state.account = new_account
+                            request.state.deepseek_token = new_token
+                            logger.info(f"[get_pow_response] 账号禁言，已切换至新账号: {get_account_identifier(new_account)}")
+                            attempts += 1
+                            continue
+                        except Exception as e:
+                            logger.error(f"[get_pow_response] 切换账号登录失败: {e}")
+                    break
+            
             pow_challenge = biz_data.get("pow_challenge", {})
             challenge = pow_challenge.get("challenge")
             if not challenge:
