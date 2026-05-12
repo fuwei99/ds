@@ -1314,6 +1314,10 @@ def list_models():
         {"id": "deepseek-reasoner-expert", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-reasoner-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
         {"id": "deepseek-reasoner-expert-search", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        
+        # Vision Models
+        {"id": "deepseek-vision", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
+        {"id": "deepseek-chat-vision", "object": "model", "created": 1715635200, "owned_by": "deepseek", "permission": []},
     ]
     data = {"object": "list", "data": models_list}
     return JSONResponse(content=data, status_code=200)
